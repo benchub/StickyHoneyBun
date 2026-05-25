@@ -29,6 +29,17 @@ CREATE FUNCTION honey_bun_send(honey_bun)
     AS 'MODULE_PATHNAME', 'honey_bun_send'
     LANGUAGE C IMMUTABLE STRICT;
 
+-- The trap's typeoutput dispatch is invoked by the protocol layer and does
+-- not consult function ACLs, so revoking direct-call EXECUTE leaves the
+-- actual trap intact. Without these REVOKEs, any session can produce a
+-- fully-formed alert with attacker-chosen tag and query via SQL like
+-- SELECT honey_bun_out('forged.tag'::honey_bun) — a free primitive for
+-- flooding the alert stream with noise or planting decoys.
+REVOKE EXECUTE ON FUNCTION honey_bun_in(cstring)      FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION honey_bun_recv(internal)   FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION honey_bun_out(honey_bun)   FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION honey_bun_send(honey_bun)  FROM PUBLIC;
+
 CREATE TYPE honey_bun (
     INPUT          = honey_bun_in,
     OUTPUT         = honey_bun_out,
@@ -43,6 +54,17 @@ COMMENT ON TYPE honey_bun IS
     'Sticky Honey Bun honeytoken type. The stored value is a tag identifying '
     'the trap location (e.g., schema.table.column). Reading the value fires '
     'a side effect that logs the access to the alert file.';
+
+-- USAGE on the type is checked when a column of this type is created or
+-- a value is cast to it. Without this REVOKE, a non-superuser could:
+--   * SELECT 'forged'::honey_bun — let result-row typeoutput dispatch
+--     produce an alert with attacker-chosen tag; or
+--   * CREATE TABLE forge (h honey_bun); INSERT … 'forged'; SELECT … —
+--     same dispatch path, attacker-owned table.
+-- Typeoutput dispatch itself does not consult USAGE, so legitimate trap
+-- reads on existing planted columns continue to fire for any role with
+-- SELECT on the underlying table.
+REVOKE USAGE ON TYPE honey_bun FROM PUBLIC;
 
 -- Comparison and hash support so DISTINCT/ORDER BY/MIN/MAX/GROUP BY work.
 -- honey_bun's internal layout matches varlena, so we bind to PG's bytea
@@ -210,6 +232,18 @@ BEGIN
             LANGUAGE C IMMUTABLE STRICT',
         send_fn, qualified);
 
+    -- Mirror the REVOKEs applied to canonical honey_bun_in/_recv/_out/_send:
+    -- otherwise an attacker just routes around the parent ACL by calling
+    -- the per-alias function directly (or via cast/insert through _in).
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s(cstring) FROM PUBLIC',
+        in_fn);
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s(internal) FROM PUBLIC',
+        recv_fn);
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s(%s) FROM PUBLIC',
+        out_fn, qualified);
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %s(%s) FROM PUBLIC',
+        send_fn, qualified);
+
     EXECUTE format(
         'CREATE TYPE %s ('
         '  INPUT          = %s,'
@@ -220,6 +254,10 @@ BEGIN
         '  STORAGE        = extended,'
         '  CATEGORY       = ''S'')',
         qualified, in_fn, out_fn, recv_fn, send_fn);
+
+    -- Mirror the REVOKE USAGE applied to the canonical type so an alias
+    -- doesn't reopen the cast / CREATE-TABLE forge path.
+    EXECUTE format('REVOKE USAGE ON TYPE %s FROM PUBLIC', qualified);
 
     -- Comparison/hash functions bound to PG's bytea internal symbols
     -- (collation-independent, same as the canonical honey_bun setup).

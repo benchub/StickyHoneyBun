@@ -26,6 +26,15 @@ CREATE FUNCTION honey_bun_in_rds(input text)
 RETURNS bytea
 AS $$
 BEGIN
+    -- Defense in depth: PG's typinput dispatch (and pg_tle's wrapper around
+    -- it) bypasses function ACLs, so REVOKE EXECUTE on this function alone
+    -- is insufficient to block 'forged'::honey_bun. Require USAGE on the
+    -- canonical honey_bun type; admins who grant USAGE on an alias only
+    -- should also grant on canonical (the simpler model).
+    IF NOT has_type_privilege(current_user, 'honey_bun'::regtype, 'USAGE') THEN
+        RAISE EXCEPTION 'permission denied for type honey_bun'
+            USING ERRCODE = 'insufficient_privilege';
+    END IF;
     RETURN convert_to(input, 'UTF8');
 END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
@@ -81,6 +90,14 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 
+-- Mirror of the self-hosted variant's I/O-function lockdown. PG's typinput
+-- and typoutput dispatch paths bypass function ACLs, so the REVOKE alone
+-- can't block 'forged'::honey_bun — but the has_type_privilege guard inside
+-- honey_bun_in_rds covers the cast path, and the REVOKE closes the direct
+-- SELECT honey_bun_in_rds(...) call path.
+REVOKE EXECUTE ON FUNCTION honey_bun_in_rds(text)   FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION honey_bun_out_rds(bytea) FROM PUBLIC;
+
 SELECT pgtle.create_base_type(
     'public',
     'honey_bun',
@@ -88,6 +105,13 @@ SELECT pgtle.create_base_type(
     'honey_bun_out_rds(bytea)'::regprocedure,
     -1
 );
+
+-- USAGE on the type is checked when a column of this type is created or
+-- when a function references it. Closes the indirect-forge path where an
+-- attacker would otherwise CREATE TABLE forge (h honey_bun); INSERT …;
+-- SELECT … to fire alerts. Operators who want a specific planter role
+-- should GRANT USAGE ON TYPE honey_bun TO that_role on this cluster.
+REVOKE USAGE ON TYPE honey_bun FROM PUBLIC;
 
 -- Registry of honey-shaped types created by this extension. pg_tle wraps
 -- typinput/typoutput internally, so we cannot reliably identify aliases by
@@ -141,9 +165,14 @@ BEGIN
     );
     new_type := format('%I.%I', type_schema, type_name)::regtype;
     INSERT INTO honey_bun_registry VALUES (new_type);
+    -- Mirror the canonical type's USAGE lockdown so an alias doesn't
+    -- reopen the indirect-forge path.
+    EXECUTE format('REVOKE USAGE ON TYPE %s FROM PUBLIC', new_type);
     RETURN new_type;
 END;
 $$;
+
+REVOKE EXECUTE ON FUNCTION create_honey_bun_alias(name, name) FROM PUBLIC;
 
 COMMENT ON FUNCTION create_honey_bun_alias(name, name) IS
     'Register a new honey-shaped type under a site-specific name. Reads of '

@@ -5,7 +5,6 @@
 #include "access/xact.h"
 #include "fmgr.h"
 #include "miscadmin.h"
-#include "pgstat.h"
 #include "postmaster/bgworker.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"

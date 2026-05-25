@@ -11,6 +11,7 @@ $node->init;
 $node->append_conf('postgresql.conf', qq{
 shared_preload_libraries = 'sticky_honey_bun'
 sticky_honey_bun.log_path = '$log_path'
+sticky_honey_bun.heartbeat_interval_seconds = 0
 });
 $node->start;
 

@@ -33,14 +33,21 @@ ok(! -e $log_path || -z $log_path,
    'enabled=off suppresses log entries on honey reads');
 
 # Attempting to flip the kill switch at runtime should NOT succeed. PGC_POSTMASTER
-# means ALTER SYSTEM may write the value but it won't take effect until restart,
-# and pg_reload_conf returns a warning we can detect via stderr.
-my ($alter_stdout, $alter_stderr, $alter_rc) =
-    $node->psql('postgres',
-                "ALTER SYSTEM SET sticky_honey_bun.enabled = on; SELECT pg_reload_conf();");
+# means ALTER SYSTEM may write the value but it won't take effect until restart.
+# (The "cannot be changed without restarting" warning goes to the server log,
+# not the client, so we can't observe it on psql's stderr — but the runtime
+# value SHOW reports is the load-bearing check anyway.)
+$node->safe_psql('postgres',
+    'ALTER SYSTEM SET sticky_honey_bun.enabled = on');
+$node->safe_psql('postgres', 'SELECT pg_reload_conf()');
+
+my $runtime = $node->safe_psql('postgres', 'SHOW sticky_honey_bun.enabled');
+is($runtime, 'off',
+    'PGC_POSTMASTER value unchanged at runtime after ALTER SYSTEM + reload');
+
 $node->safe_psql('postgres', 'SELECT * FROM t');
 ok(! -e $log_path || -z $log_path,
-   'pg_reload_conf does not enable the trap mid-run (PGC_POSTMASTER)');
+   'reload does not enable the trap mid-run (PGC_POSTMASTER)');
 
 # Stop and restart with enabled=on to confirm the trap CAN be enabled,
 # just not at runtime. Append wins over the earlier "off" via last-wins parsing.

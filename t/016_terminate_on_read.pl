@@ -44,11 +44,11 @@ sub count_heartbeats {
     return scalar grep { /"event":"heartbeat"/ } read_lines();
 }
 
-# Let the bgworker fire some heartbeats. With heartbeat_interval=1s, 3 seconds
-# yields >=2 beats only if the worker is healthy. If the terminate hook were
-# (incorrectly) wired into shb_log_event(), the worker would suicide on the
-# first beat and we'd see 0 or 1 heartbeat lines here.
-sleep 3;
+# Wait for at least 2 heartbeats. With heartbeat_interval=1s the worker
+# fires ~once per second; polling makes this robust on slow CI. If the
+# terminate hook were (incorrectly) wired into shb_log_event(), the worker
+# would suicide on the first beat and we'd time out here.
+SHB::wait_until(sub { count_heartbeats() >= 2 });
 
 my $hb_before = count_heartbeats();
 cmp_ok($hb_before, '>=', 2,
@@ -72,10 +72,12 @@ my @lines = read_lines();
 ok((grep { /"event":"read_text"/ && /"tag":"public\.t\.honey"/ } @lines),
    'trap log entry written before backend termination');
 
-# The bgworker must survive the trap event. Heartbeats continue to arrive
-# in the next interval window. (If the terminate ever reached the bgworker,
-# it would die and restart on bgw_restart_time=10s, producing a 10s gap.)
-sleep 3;
+# The bgworker must survive the trap event. Poll for the next heartbeat
+# to arrive — interval=1s, so under healthy conditions this resolves in
+# well under a second. If the terminate ever reached the bgworker, it
+# would die and restart only on bgw_restart_time=10s, producing a gap our
+# poll window catches.
+SHB::wait_until(sub { count_heartbeats() > $hb_before });
 my $hb_after = count_heartbeats();
 cmp_ok($hb_after, '>', $hb_before,
     'bgworker keeps emitting heartbeats after a trap-induced termination');

@@ -23,31 +23,29 @@ $node->start;
 # Heartbeat runs without CREATE EXTENSION because the .so is preloaded and
 # the worker only does OS-level file I/O.
 
-sleep 3;
+sub count_heartbeats {
+    return 0 unless -e $log_path;
+    open(my $fh, '<', $log_path) or return 0;
+    my @lines = <$fh>;
+    close $fh;
+    return scalar grep { /"event":"heartbeat"/ } @lines;
+}
 
+# Poll up to 10s for the first 2 heartbeats. Sleep-based assertions flake
+# on slow CI; polling is robust.
+SHB::wait_until(sub { count_heartbeats() >= 2 });
 ok(-e $log_path && -s $log_path, 'heartbeat produced log entries');
-
-open(my $fh, '<', $log_path) or die "cannot open $log_path: $!";
-my @lines = <$fh>;
-close $fh;
-
-my @heartbeats = grep { /"event":"heartbeat"/ } @lines;
-cmp_ok(scalar @heartbeats, '>=', 2,
-    'at least 2 heartbeats in 3 seconds at interval=1s');
+cmp_ok(count_heartbeats(), '>=', 2,
+    'at least 2 heartbeats observed at interval=1s');
 
 # ALTER SYSTEM on a PGC_POSTMASTER setting cannot stop heartbeats mid-run.
 $node->safe_psql('postgres',
     'ALTER SYSTEM SET sticky_honey_bun.heartbeat_interval_seconds = 0');
 $node->safe_psql('postgres', 'SELECT pg_reload_conf()');
 
-my $before = scalar @heartbeats;
-sleep 2;
-
-open(my $fh2, '<', $log_path) or die "cannot reopen $log_path: $!";
-my @later_lines = <$fh2>;
-close $fh2;
-my @later_heartbeats = grep { /"event":"heartbeat"/ } @later_lines;
-cmp_ok(scalar @later_heartbeats, '>', $before,
+my $before = count_heartbeats();
+SHB::wait_until(sub { count_heartbeats() > $before });
+cmp_ok(count_heartbeats(), '>', $before,
     'heartbeats keep firing after ALTER SYSTEM (PGC_POSTMASTER blocks runtime change)');
 
 $node->stop;

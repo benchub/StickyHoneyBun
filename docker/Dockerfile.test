@@ -5,6 +5,13 @@ ARG PG_MAJOR
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
 
+# Optional extra flags for sanitizer / hardening builds. Default empty
+# preserves the standard build behavior; `make docker-test-ubsan-N` sets
+# this to enable UBSAN.
+ARG EXTRA_CFLAGS=""
+ENV PG_CPPFLAGS="${EXTRA_CFLAGS}"
+ENV COPT="${EXTRA_CFLAGS}"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \
@@ -12,6 +19,7 @@ RUN apt-get update \
         libkrb5-dev \
         libipc-run-perl \
         libtest-simple-perl \
+        libubsan1 \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src

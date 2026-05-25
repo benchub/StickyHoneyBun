@@ -285,8 +285,15 @@ shb_log_event(const char *event, const char *tag)
     oldcontext = CurrentMemoryContext;
     oldowner   = CurrentResourceOwner;
 
+    /*
+     * BeginInternalSubTransaction switches CurrentMemoryContext into the
+     * new subtxn's CurTransactionContext. We DELIBERATELY stay there for
+     * the body of do_log_event so that any palloc/initStringInfo inside
+     * gets cleaned up by RollbackAndReleaseCurrentSubTransaction on the
+     * error path. (An earlier version switched back to oldcontext here,
+     * which leaked line.data on every failed event.)
+     */
     BeginInternalSubTransaction(NULL);
-    MemoryContextSwitchTo(oldcontext);
 
     PG_TRY();
     {

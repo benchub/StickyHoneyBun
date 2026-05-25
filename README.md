@@ -24,6 +24,35 @@ Sticky Honey Bun alerts are simple - they just log information about who, what, 
 - **Stopping exfiltration** is not a primary goal of Sticky Honey Bun, only detecting it and possibly taking action. If you have an attacker that can read a honeytoken, it is too late. The `terminate_on_read` GUC is a best-effort circuit breaker: when enabled, an in-flight bulk read is halted at the next inter-row interrupt check, so the leaked surface is bounded — but the trap is also unmasked to the attacker. Off by default.
 - **OS-level exfiltration**, such as file copies or restoring backups to an unmanaged server, is well beyond anything Sticky Honey Bun can even know about, much less take action on.
 
+## Where it sits in the landscape
+
+Database deception is not a new field. Sticky Honey Bun occupies a
+specific niche — *in-engine, column-level, read-time tripwire* — that
+existing tools don't fill:
+
+| Tool | What it is | Where it lives | Triggers on | Cost on common path |
+|---|---|---|---|---|
+| **Sticky Honey Bun** | column-level tripwire | inside real production tables | read of a planted honey row | ~0 (STRICT I/O short-circuits NULL) |
+| `pgAudit` | statement audit log | PG extension | every audited statement | per-statement overhead |
+| Canarytokens (Thinkst) | external tokens (URLs, AWS keys, doc traps) | outside the DB | attacker *uses* the token later | 0 in-DB |
+| FDW decoys (e.g. PG Decoy) | table-level decoys | foreign tables that look real | `SELECT` against the decoy | 0 if attacker ignores the decoy |
+| Standalone DB honeypots | decoy database servers | separate infrastructure | attacker connects / explores | 0 (different system) |
+
+These are not either/or. A defensible setup runs `pgAudit` for the
+compliance / forensic trail, Canarytokens for post-exfiltration
+detection, and SHB as the in-engine tripwire layered on top — each
+catches a different attacker behavior:
+
+- `pgAudit`: "what happened?" (everything, after the fact)
+- Canarytokens: "did the stolen artifact get used somewhere?" (later)
+- SHB: "did someone touch the bait *right now*?" (immediately, inside PG)
+
+SHB's distinct contribution is the combination of read-time detection
+and zero-noise-from-application-traffic: legitimate queries that don't
+touch planted rows produce no log entries at all. It does NOT replace
+audit logging (`pgAudit` is for the full trail) or external token
+detection (Canarytokens covers what happens after the data leaves PG).
+
 ## Repository layout
 
 ```
@@ -329,6 +358,12 @@ behavior under test, and asserts against the log file or DB state.
 | `t/024_field_injection.pl` | The alert object's non-`query` user-influenced fields (`tag` from planted honey values, `application_name` from session GUC) round-trip JSON-safely; embedded newlines, quotes, and forge-shaped bytes cannot hijack the outer object's `event` field |
 | `t/025_log_permission_denied.pl` | When the log path's parent directory is unwriteable (e.g. EACCES on `open()`), the trap query still succeeds with rows returned and no extension-shaped error leaks to the client; alerts resume cleanly once writability is restored |
 | `t/026_log_rotation.pl` | Renaming or deleting the live log file (the pattern logrotate's `create` mode uses) is handled cleanly: the next trap event recreates the file at the configured path and does not touch the rotated copy |
+| `t/027_red_team.pl` | Adversarial playbook against every defense layer (direct-call REVOKE, USAGE revoke, type-system USAGE check, PGC_POSTMASTER lock on `enabled`, frozen log_path, inventory-view lockdown). Asserts each attack vector fails AND that the legitimate read-path trap still fires |
+| `t/028_streaming_replica.pl` | Primary + streaming hot-standby in one TAP file: trap fires on the standby via typeoutput dispatch and writes to the standby's own log file, the primary's log is not touched, and the standby is verified to actually be in recovery |
+| `t/029_logical_replication.pl` | Publisher + subscriber: the subscription's apply worker materializes honey rows via `honey_bun_recv` (passing the C-level USAGE check when the subscription owner has USAGE) and subsequent subscriber-side reads fire the trap on the subscriber's own log |
+| `t/030_utf8_and_encoding.pl` | Multi-byte UTF-8 (Japanese, emoji, Cyrillic, Greek, Arabic, diacritics) in `tag` and in `query` round-trip verbatim through `escape_json`; all standard log fields are present on every line (field-stability regression guard) |
+| `t/031_recon_paths.pl` | Documents the recon paths open to a non-superuser (`pg_type`, `pg_proc.prosrc`, `pg_attribute` joins reconstruct the inventory) and the one closed path (`honey_bun_columns` view). Pins both states so future hardening or accidental loosening shows up as test churn |
+| `t/032_bgworker_resilience.pl` | Heartbeat bgworker is visible in `pg_stat_activity` with the expected `backend_type` and database, and is emitting heartbeats at the configured interval — the deadman's "is the trap alive?" signal |
 
 The RDS variant has a manual smoke test (`rds/smoke_test.sh`) since it
 requires a real RDS/Aurora cluster with `pg_tle` and `aws_lambda`.
@@ -398,6 +433,79 @@ cp tools/sticky_honey_bun.logrotate /etc/logrotate.d/sticky_honey_bun
 ```
 
 and edit the path on the first line to match your `sticky_honey_bun.log_path`.
+
+## Operations
+
+### Forensics / incident response
+
+When a real alert fires, the JSON line carries everything an IR needs to
+start digging. Walking it field by field:
+
+| Field | What it tells you |
+|---|---|
+| `ts` | UTC microsecond timestamp — joinable with PG's own `csvlog`/`jsonlog` |
+| `session_user` | the authenticated identity — immune to `SET ROLE`, so it survives the obvious pivot |
+| `current_user` | the *effective* identity after any `SET ROLE` — if `≠ session_user`, that's a red flag |
+| `application_name` | spoofable via `PGAPPNAME`; use as a weak signal only |
+| `database` + `pid` | the join keys for correlating with PG's `log_line_prefix` / `csvlog` for surrounding-session activity |
+| `client_addr` | source IP — keep in mind proxies (PgBouncer, RDS Proxy) rewrite this to the proxy's address |
+| `tag` | which trap was hit. The recommended `schema.table.column` convention makes this self-describing |
+| `query` | the SQL text that triggered the read — can be NULL for some internal call paths (replication apply, autovacuum-adjacent code) |
+
+Recommended correlation: enable PG's own `log_line_prefix` with `%m %p %u
+%d %a %h` and `log_statement = 'mod'` (or higher) before incidents
+happen. When a trap fires, join on `pid` + the session window around `ts`
+to see what else the attacker did in the same session.
+
+### PII and retention
+
+The alert log can legitimately contain personal data:
+- `client_addr` is an IP address.
+- `session_user` can be a real person's identity if your roles are
+  per-user.
+- `query` carries arbitrary SQL text — it may contain literal email
+  addresses, names, account numbers, etc. from `WHERE` clauses or
+  string literals.
+
+Treat the alert log as PII-bearing for retention purposes. Specifically:
+- Apply the same retention schedule as your other audit logs (typically
+  90 days to 7 years depending on jurisdiction and use case).
+- A GDPR/CCPA right-to-erasure request that touches the subject's
+  identifiers may require redaction of historical alerts.
+- The extension provides no built-in tamper-evidence — a compromised
+  superuser with OS-level access can edit the log file. If that matters
+  for compliance, ship the log to a write-once external sink (S3 with
+  object lock, CloudWatch Logs, Splunk HEC, etc.) and keep the local
+  copy as a cache only.
+
+### Capacity guidance
+
+Rough planning numbers:
+- A typical alert line is ~500 bytes of JSON (well-formed but not minified).
+- A long `debug_query_string` (multi-KB ORM output, big `IN` lists,
+  embedded blobs) can push a single line into the multi-KB range; `t/014`
+  exercises 16 KB lines successfully.
+- Heartbeats at the default `heartbeat_interval_seconds = 60` produce
+  ~1,440 lines/day ≈ ~700 KB/day ≈ ~250 MB/year.
+- A `pg_dump` of a 100M-row honey-bearing table will produce 100M alert
+  lines (one per row). Budget accordingly, and suppress at the alert
+  processor via `session_user` + `client_addr` matching the known dump
+  role/host.
+
+Plan log rotation by size, not interval. The shipped logrotate config
+(`tools/sticky_honey_bun.logrotate`) defaults to size-based with a
+weekly fallback.
+
+### Common configuration mistakes
+
+| Mistake | Symptom | Fix |
+|---|---|---|
+| `sticky_honey_bun.enabled = off` left in postgresql.conf from a test | trap fires silently produce no log entries | flip back to `on` (or unset; default is `on`); a regression test like `t/007` catches the runtime-bypass attempt but won't catch a misset baseline |
+| `sticky_honey_bun.log_path` unset and the system `log_directory` doesn't point where you expected | alerts land somewhere weird | always set `log_path` explicitly; macOS Homebrew is the most common surprise |
+| `heartbeat_interval_seconds = 0` in production | the deadman never trips, so a silent logger looks like silence | use the default (`60`) unless you have a specific reason |
+| `terminate_on_read = on` enabled by surprise | legitimate scans (audits, ORM batch jobs) terminate connections | enable only after rehearsing with non-production traffic |
+| Forgot to `GRANT USAGE ON TYPE honey_bun` to a non-superuser planter role | `INSERT INTO honey_table` fails with `permission denied for type` | grant USAGE to the specific planter role; the trap mechanism itself does not need USAGE |
+| Subscriber replicating a honey-bearing table without USAGE on the subscriber cluster | the apply worker errors out and the subscription stalls | grant USAGE on the subscriber to whichever role owns the subscription |
 
 ## Roadmap
 
@@ -543,3 +651,8 @@ and edit the path on the first line to match your `sticky_honey_bun.log_path`.
   with `pg_read_all_data` (which `rds_superuser` has) can inspect them. This
   is a hard limitation of running in managed Postgres; for tamper resistance
   use the self-hosted variant.
+
+## License
+
+Sticky Honey Bun is released under the PostgreSQL License — the same
+permissive license PostgreSQL itself ships under. Full text in `LICENSE`.

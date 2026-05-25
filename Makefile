@@ -22,6 +22,7 @@ help:
 	@echo "  docker-matrix        build against all of: $(PG_VERSIONS)"
 	@echo "  docker-test-N        build + run TAP tests against PG N in a container"
 	@echo "  docker-test-matrix   test against all of: $(PG_TEST_VERSIONS)"
+	@echo "  docker-test-ubsan-N  test against PG N with the extension built under UBSAN"
 	@echo "  docker-clean         remove tagged docker images"
 	@echo "  install              install locally-built extension (after 'local')"
 	@echo "  clean                remove local build artifacts"
@@ -93,3 +94,28 @@ $(foreach v,$(PG_TEST_VERSIONS),$(eval $(call DOCKER_TEST_TARGET,$(v))))
 .PHONY: docker-test-matrix
 docker-test-matrix: $(addprefix docker-test-,$(PG_TEST_VERSIONS))
 	@echo "==> Test matrix complete for: $(PG_TEST_VERSIONS)"
+
+# UBSAN build: recompile only the extension with -fsanitize=undefined and
+# run the test suite under it. PG itself stays uninstrumented (apt
+# postgres binary), so UBSAN checks fire only inside our code — which is
+# exactly the surface we want to vet after touching honey_bun.c /
+# logger.c / heartbeat.c. -fno-sanitize-recover makes any UB an abort
+# rather than a warning, so a UBSAN trip surfaces as test failure.
+#
+# Sanitizer flags need to reach both compile and link, which is why we
+# pass them via EXTRA_CFLAGS (the Dockerfile turns this into PG_CPPFLAGS
+# and COPT).
+UBSAN_FLAGS = -fsanitize=undefined -fno-sanitize-recover=undefined
+
+define DOCKER_TEST_UBSAN_TARGET
+.PHONY: docker-test-ubsan-$(1)
+docker-test-ubsan-$(1):
+	@echo "==> Testing against PostgreSQL $(1) with UBSAN"
+	docker build $(if $(DOCKER_PLATFORM),--platform $(DOCKER_PLATFORM)) \
+		--build-arg PG_MAJOR=$(1) \
+		--build-arg EXTRA_CFLAGS="$(UBSAN_FLAGS)" \
+		--file docker/Dockerfile.test \
+		--tag sticky-honey-bun-test-ubsan:pg$(1) \
+		.
+endef
+$(foreach v,$(PG_TEST_VERSIONS),$(eval $(call DOCKER_TEST_UBSAN_TARGET,$(v))))

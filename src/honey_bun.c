@@ -106,6 +106,13 @@ honey_bun_recv(PG_FUNCTION_ARGS)
     result = cstring_to_text_with_len(str, nbytes);
     pfree(str);
 
+    /*
+     * PG convention: typreceive must consume the entire message buffer.
+     * Without this, a client sending extra trailing bytes (crafted COPY
+     * BINARY / pq protocol frame) would be accepted silently.
+     */
+    pq_getmsgend(buf);
+
     PG_RETURN_TEXT_P(result);
 }
 

@@ -27,7 +27,7 @@ Sticky Honey Bun alerts are simple - they simply logs information about who, wha
 - **Protection against writes** from malicious users. Removing rows, encrypting data, or inserting poisoned values - Sticky Honey Bun doesn't care about any of that.
 - **Unauthorized access**: You database should be heavily firewalled and have a robust user authentication setup. Users should have proper permission controls. Sticky Honey Bun will not help with those defenses. By the time an attacker might encounter Sticky Honey Bun, they are already inside your database, accessing data freely.
 - **Protection against compromised admins**: If you can remove extensions, you can remove Sticky Honey Bun.
-- **Stopping exfiltration** is not a goal of Sticky Honey Bun, only detecting it and possibly taking action. If you have an attacker that can read a honeytoken, it is too late.
+- **Stopping exfiltration** is not a primary goal of Sticky Honey Bun, only detecting it and possibly taking action. If you have an attacker that can read a honeytoken, it is too late. The `terminate_on_read` GUC is a best-effort circuit breaker: when enabled, an in-flight bulk read is halted at the next inter-row interrupt check, so the leaked surface is bounded — but the trap is also unmasked to the attacker. Off by default.
 
 ## Repository layout
 
@@ -104,8 +104,9 @@ shared_preload_libraries = 'sticky_honey_bun'
 | `sticky_honey_bun.log_path` | string | **postmaster** | resolved from `log_directory` | Path to the alert file. Locked at server start to prevent a compromised superuser from redirecting writes (e.g. to `/dev/null`) via `ALTER SYSTEM`. Parent directory must exist. |
 | `sticky_honey_bun.enabled` | bool | **postmaster** | `on` | Master kill switch. Locked at server start so a compromised superuser session cannot disable the trap via `ALTER SYSTEM`. |
 | `sticky_honey_bun.heartbeat_interval_seconds` | int (seconds) | **postmaster** | `60` | Seconds between heartbeat lines from the bgworker. `0` disables heartbeats. Locked at server start to prevent runtime silencing. |
+| `sticky_honey_bun.terminate_on_read` | bool | **postmaster** | `off` | When `on`, a backend that reads a honey value is terminated (via SIGTERM) immediately after the alert is logged. Unmasks the trap to the attacker; in exchange the in-flight query halts at the next CHECK_FOR_INTERRUPTS. Only ordinary client backends are terminated — the heartbeat bgworker, parallel workers, and walsenders are spared. Locked at server start. |
 
-All three GUCs are deliberately `PGC_POSTMASTER`: they can only be set in
+All four GUCs are deliberately `PGC_POSTMASTER`: they can only be set in
 `postgresql.conf` at server start. Changing them requires a real server
 restart, which is auditable infrastructure activity rather than a quiet
 `ALTER SYSTEM` call.
@@ -302,6 +303,8 @@ behavior under test, and asserts against the log file or DB state.
 | `t/011_select_shapes.pl` | Trap fires for `SELECT *`, `WHERE`, `LIMIT`, `DISTINCT`, `MIN`/`MAX`, `GROUP BY`, `ORDER BY`; does not fire for `count(col)` or subqueries that project the column away |
 | `t/012_partial_index.pl` | `CREATE INDEX ... WHERE honey IS NOT NULL` succeeds on honey_bun and on aliased types; building the index does not fire the trap; indexed reads do |
 | `t/013_inventory_lockdown.pl` | Non-superusers cannot SELECT from `honey_bun_columns`; explicit GRANT to an audit role works |
+| `t/016_terminate_on_read.pl` | `terminate_on_read = on` kills the reading backend after the log line is written; heartbeat bgworker survives; `ALTER SYSTEM` + reload cannot enable it at runtime |
+| `t/017_query_injection.pl` | SQL-comment payloads shaped to forge a second JSON event (close-brace + open-brace sequences, embedded newlines, control chars) cannot corrupt the log: every line stays valid JSON with the legitimate `event`/`tag` values |
 
 The RDS variant has a manual smoke test (`rds/smoke_test.sh`) since it
 requires a real RDS/Aurora cluster with `pg_tle` and `aws_lambda`.
@@ -442,6 +445,14 @@ and edit the path on the first line to match your `sticky_honey_bun.log_path`.
 - **Logical replication subscribers need the extension installed.** If you
   replicate a table containing a `honey_bun` column, the subscriber must
   also have the extension. Otherwise it cannot decode incoming rows.
+
+- **`terminate_on_read` only fires from ordinary client backends.** Parallel
+  workers and walsenders execute the same type I/O code but are spared the
+  SIGTERM, so logical replication keeps flowing on the publisher and parallel
+  plans don't deadlock partway through. The alert still fires from those
+  paths; only the termination is suppressed. In practice the leader is where
+  result-row typoutput runs for a normal `SELECT *`, so the bulk-exfil case
+  is covered.
 
 - **The `honey_bun_out` function may be invoked more than once per row.**
   PostgreSQL does not guarantee exactly-once invocation of `typoutput`. Treat

@@ -39,6 +39,7 @@ honey_bun_out(PG_FUNCTION_ARGS)
     char *tag = text_to_cstring(value);
 
     shb_log_event("read_text", tag);
+    shb_terminate_self_if_configured();
 
     PG_RETURN_CSTRING(tag);
 }
@@ -66,6 +67,7 @@ honey_bun_send(PG_FUNCTION_ARGS)
     StringInfoData  buf;
 
     shb_log_event("read_binary", tag);
+    shb_terminate_self_if_configured();
 
     pq_begintypsend(&buf);
     pq_sendtext(&buf, VARDATA_ANY(value), VARSIZE_ANY_EXHDR(value));

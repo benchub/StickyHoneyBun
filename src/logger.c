@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <netdb.h>
+#include <signal.h>
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -21,8 +22,9 @@
 #define SHB_DEFAULT_FILENAME "sticky_honey_bun.log"
 #define SHB_FALLBACK_DIR     "/var/log/postgresql"
 
-static char *shb_log_path = NULL;
-static bool  shb_enabled  = true;
+static char *shb_log_path          = NULL;
+static bool  shb_enabled           = true;
+static bool  shb_terminate_on_read = false;
 
 void
 shb_register_gucs(void)
@@ -49,6 +51,24 @@ shb_register_gucs(void)
         "via ALTER SYSTEM.",
         &shb_enabled,
         true,
+        PGC_POSTMASTER,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "sticky_honey_bun.terminate_on_read",
+        "Terminate the backend after a honeytoken read.",
+        "When true, a session that reads a honey value is terminated "
+        "immediately after the alert is logged. This unmasks the trap to "
+        "the attacker; in exchange the in-flight query is halted at the "
+        "next CHECK_FOR_INTERRUPTS, limiting bulk exfiltration. Only "
+        "ordinary client backends are terminated; the heartbeat bgworker, "
+        "parallel workers, and walsenders are spared so heartbeats and "
+        "logical replication continue to function. PGC_POSTMASTER: locked "
+        "at server start so a compromised superuser session cannot bypass "
+        "the kill via ALTER SYSTEM.",
+        &shb_terminate_on_read,
+        false,
         PGC_POSTMASTER,
         0,
         NULL, NULL, NULL);
@@ -182,4 +202,23 @@ shb_log_event(const char *event, const char *tag)
         FlushErrorState();
     }
     PG_END_TRY();
+}
+
+/*
+ * Called from the typoutput / typsend paths after a trap is logged.
+ * Deliberately NOT called from shb_log_event(): the heartbeat bgworker
+ * shares that path, and self-terminating from a bgworker would suicide-
+ * restart-suicide every bgw_restart_time seconds. The MyBackendType guard
+ * is belt-and-suspenders against the same mistake in future call sites,
+ * and also skips parallel workers and walsenders so logical replication
+ * keeps flowing on the publisher.
+ */
+void
+shb_terminate_self_if_configured(void)
+{
+    if (!shb_enabled || !shb_terminate_on_read)
+        return;
+    if (MyBackendType != B_BACKEND)
+        return;
+    kill(MyProcPid, SIGTERM);
 }

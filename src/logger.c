@@ -157,111 +157,99 @@ shb_resolve_log_path_once(void)
     MemoryContextSwitchTo(old);
 }
 
+/*
+ * Atomic write of a single fully-built line to the alert file.
+ *
+ * Open + flock + write + close as one syscall sequence. NO PostgreSQL
+ * functions are called here, so this cannot ereport — which means we can
+ * call it from any context including a bgworker without a database
+ * connection, and we never have to worry about fd leaks across a longjmp.
+ *
+ * O_NOFOLLOW: if the target is a symlink (an attacker may have swapped
+ * the file to redirect alerts), the open fails with ELOOP. flock blocks
+ * concurrent backends because O_APPEND atomicity is only guaranteed up to
+ * PIPE_BUF (4 KB) and our lines can exceed that. write() is looped to
+ * tolerate short returns from NFS / FUSE / signal-after-partial-progress.
+ * Every failure path drops the event silently, matching the project's
+ * "broken log path must not surface as a SELECT error" rule.
+ */
 static void
-do_log_event(const char *event, const char *tag)
+write_line_locked(StringInfo line)
 {
-    int             fd;
-    struct timeval  tv;
-    struct tm       tm_utc;
-    char            ts[32];
-    char            client[NI_MAXHOST];
-    StringInfoData  line;
-    ssize_t         total;
+    int     fd;
+    ssize_t total = 0;
 
     if (!shb_resolved_log_path)
         return;
 
-    /*
-     * O_NOFOLLOW: if the target is a symlink, fail with ELOOP rather than
-     * follow it. Without this an attacker with parent-directory write can
-     * swap the log file for a symlink to /dev/null (silently suppress
-     * alerts) or to any other file the postgres user can write.
-     */
     fd = open(shb_resolved_log_path,
               O_WRONLY | O_APPEND | O_CREAT | O_NOFOLLOW, 0640);
     if (fd < 0)
         return;
 
-    /*
-     * O_APPEND atomicity is only guaranteed up to PIPE_BUF (4 KB on Linux);
-     * a long debug_query_string can push the JSON line over that. flock the
-     * fd before writing so concurrent backends serialize cleanly. The lock
-     * releases automatically on close().
-     *
-     * If flock fails (e.g., NFS without lockd, or signal interruption),
-     * drop the event rather than writing unlocked — interleaved writes
-     * would produce corrupt JSON that the alert processor would have to
-     * throw away anyway, and silently dropping matches every other I/O
-     * failure on this path. Done outside PG_TRY because flock cannot
-     * ereport and we need a safe early return.
-     */
     if (flock(fd, LOCK_EX) < 0)
     {
         close(fd);
         return;
     }
 
-    /*
-     * Everything below this point can ereport(ERROR) — palloc, syscache
-     * lookups in GetUserNameFromId / get_database_name, escape_json. The
-     * fd is a raw kernel handle (not VFD-managed), so a longjmp out of
-     * here would leak it. Inner PG_TRY closes the fd on the error path
-     * and re-throws to the outer (subtransaction-rolled-back) handler.
-     */
-    PG_TRY();
+    while (total < line->len)
     {
-        gettimeofday(&tv, NULL);
-        gmtime_r(&tv.tv_sec, &tm_utc);
-        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_utc);
-        get_client_addr(client, sizeof(client));
-
-        initStringInfo(&line);
-        appendStringInfoChar(&line, '{');
-        appendStringInfo(&line, "\"ts\":\"%s.%06ldZ\"", ts, (long) tv.tv_usec);
-        append_kv_str(&line, "event", event, false);
-        append_kv_str(&line, "tag", tag, false);
-        append_kv_str(&line, "session_user",
-                      GetUserNameFromId(GetSessionUserId(), true), false);
-        append_kv_str(&line, "current_user",
-                      GetUserNameFromId(GetUserId(), true), false);
-        append_kv_str(&line, "application_name",
-                      GetConfigOption("application_name", true, false), false);
-        append_kv_str(&line, "database", get_database_name(MyDatabaseId), false);
-        append_kv_int(&line, "pid", MyProcPid, false);
-        append_kv_str(&line, "client_addr", client, false);
-        append_kv_str(&line, "query", debug_query_string, false);
-        appendStringInfoChar(&line, '}');
-        appendStringInfoChar(&line, '\n');
-
-        /*
-         * Loop the write. write() to a regular file on a local FS normally
-         * returns count or -1, but NFS / FUSE / signal-after-partial-progress
-         * can produce a short positive return. Without the loop a short
-         * write produces a truncated JSON line that downstream parsers
-         * have to drop.
-         */
-        total = 0;
-        while (total < line.len)
+        ssize_t n = write(fd, line->data + total, line->len - total);
+        if (n < 0)
         {
-            ssize_t n = write(fd, line.data + total, line.len - total);
-            if (n < 0)
-            {
-                if (errno == EINTR)
-                    continue;
-                break;
-            }
-            total += n;
+            if (errno == EINTR)
+                continue;
+            break;
         }
-        pfree(line.data);
+        total += n;
     }
-    PG_CATCH();
-    {
-        close(fd);
-        PG_RE_THROW();
-    }
-    PG_END_TRY();
 
     close(fd);
+}
+
+static void
+do_log_event(const char *event, const char *tag)
+{
+    struct timeval  tv;
+    struct tm       tm_utc;
+    char            ts[32];
+    char            client[NI_MAXHOST];
+    StringInfoData  line;
+
+    /*
+     * Everything in this function up to write_line_locked can ereport
+     * (palloc, syscache lookups, escape_json). That's fine: the caller
+     * (shb_log_event) wraps us in a subtransaction whose rollback frees
+     * the StringInfo's backing palloc on the error path. No file
+     * descriptor is held at any of those points — write_line_locked
+     * acquires + releases the fd as an atomic syscall sequence.
+     */
+    gettimeofday(&tv, NULL);
+    gmtime_r(&tv.tv_sec, &tm_utc);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_utc);
+    get_client_addr(client, sizeof(client));
+
+    initStringInfo(&line);
+    appendStringInfoChar(&line, '{');
+    appendStringInfo(&line, "\"ts\":\"%s.%06ldZ\"", ts, (long) tv.tv_usec);
+    append_kv_str(&line, "event", event, false);
+    append_kv_str(&line, "tag", tag, false);
+    append_kv_str(&line, "session_user",
+                  GetUserNameFromId(GetSessionUserId(), true), false);
+    append_kv_str(&line, "current_user",
+                  GetUserNameFromId(GetUserId(), true), false);
+    append_kv_str(&line, "application_name",
+                  GetConfigOption("application_name", true, false), false);
+    append_kv_str(&line, "database", get_database_name(MyDatabaseId), false);
+    append_kv_int(&line, "pid", MyProcPid, false);
+    append_kv_str(&line, "client_addr", client, false);
+    append_kv_str(&line, "query", debug_query_string, false);
+    appendStringInfoChar(&line, '}');
+    appendStringInfoChar(&line, '\n');
+
+    write_line_locked(&line);
+    pfree(line.data);
 }
 
 void
@@ -310,6 +298,72 @@ shb_log_event(const char *event, const char *tag)
         CurrentResourceOwner = oldowner;
     }
     PG_END_TRY();
+}
+
+/*
+ * Heartbeat-specific log entry.
+ *
+ * Deliberately separate from shb_log_event() because the bgworker calling
+ * us has NO database connection — it's registered with BGWORKER_SHMEM_ACCESS
+ * only, no BGWORKER_BACKEND_DATABASE_CONNECTION. That means we cannot do
+ * any of the syscache lookups (GetUserNameFromId, get_database_name) that
+ * do_log_event() does, and we cannot start a transaction to wrap the work
+ * in a subtransaction either. Trying to do either would crash the worker.
+ *
+ * The heartbeat line is therefore a minimal shape: ts, event, tag, pid.
+ * That's all the bgworker has anyway — there's no session_user/database/
+ * application_name/client_addr/query to populate. The alert processor must
+ * tolerate a heartbeat line missing those fields.
+ *
+ * A short-lived MemoryContext absorbs the StringInfo so a palloc failure
+ * during line construction doesn't leak across heartbeats.
+ */
+void
+shb_log_heartbeat(void)
+{
+    static MemoryContext heartbeat_ctx = NULL;
+    MemoryContext        oldcontext;
+    struct timeval       tv;
+    struct tm            tm_utc;
+    char                 ts[32];
+    StringInfoData       line;
+
+    if (!shb_enabled)
+        return;
+
+    if (heartbeat_ctx == NULL)
+        heartbeat_ctx = AllocSetContextCreate(TopMemoryContext,
+                                              "shb heartbeat",
+                                              ALLOCSET_SMALL_SIZES);
+
+    oldcontext = MemoryContextSwitchTo(heartbeat_ctx);
+
+    PG_TRY();
+    {
+        gettimeofday(&tv, NULL);
+        gmtime_r(&tv.tv_sec, &tm_utc);
+        strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_utc);
+
+        initStringInfo(&line);
+        appendStringInfoChar(&line, '{');
+        appendStringInfo(&line, "\"ts\":\"%s.%06ldZ\"",
+                         ts, (long) tv.tv_usec);
+        appendStringInfoString(&line, ",\"event\":\"heartbeat\"");
+        appendStringInfoString(&line, ",\"tag\":\"heartbeat\"");
+        appendStringInfo(&line, ",\"pid\":%d", MyProcPid);
+        appendStringInfoChar(&line, '}');
+        appendStringInfoChar(&line, '\n');
+
+        write_line_locked(&line);
+    }
+    PG_CATCH();
+    {
+        FlushErrorState();
+    }
+    PG_END_TRY();
+
+    MemoryContextSwitchTo(oldcontext);
+    MemoryContextReset(heartbeat_ctx);
 }
 
 /*

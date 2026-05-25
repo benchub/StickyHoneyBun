@@ -2,7 +2,6 @@
 
 #include <limits.h>
 
-#include "access/xact.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
@@ -27,7 +26,15 @@ shb_heartbeat_main(Datum main_arg)
     pqsignal(SIGTERM, SignalHandlerForShutdownRequest);
     BackgroundWorkerUnblockSignals();
 
-    BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+    /*
+     * Deliberately do NOT call BackgroundWorkerInitializeConnection. The
+     * worker is registered with BGWORKER_SHMEM_ACCESS only — it does not
+     * touch any database catalog or maintain a transaction. shb_log_heartbeat
+     * writes a minimal JSON line (ts/event/tag/pid) directly to the alert
+     * file. This way the bgworker has no dependency on any database
+     * existing; dropping `postgres` (or any other db) cannot break the
+     * deadman.
+     */
 
     while (!ShutdownRequestPending)
     {
@@ -36,9 +43,7 @@ shb_heartbeat_main(Datum main_arg)
 
         if (interval > 0)
         {
-            StartTransactionCommand();
-            shb_log_event("heartbeat", "heartbeat");
-            CommitTransactionCommand();
+            shb_log_heartbeat();
 
             events = WaitLatch(MyLatch,
                                WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
@@ -88,7 +93,7 @@ shb_register_bgworker(void)
         NULL, NULL, NULL);
 
     memset(&worker, 0, sizeof(worker));
-    worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+    worker.bgw_flags = BGWORKER_SHMEM_ACCESS;
     worker.bgw_start_time = BgWorkerStart_ConsistentState;
     worker.bgw_restart_time = 10;
     snprintf(worker.bgw_library_name,  BGW_MAXLEN, "sticky_honey_bun");

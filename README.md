@@ -2,27 +2,42 @@
 
 ![Sticky Honey Bun](yum.png)
 
-Sticky Honey Bun is a PostgreSQL extension that gives you honeytokens in the form of a custom data type. Simply add a new column of the type `honey_bun` to any table(s) you want, put a non-null value into this column for any row(s) that you will never select, and 💥! You now have a trap for an attacker who comes in and does an unwary `SELECT * FROM table`.
+Sticky Honey Bun is a PostgreSQL extension that gives you honeytokens in the form of a custom data type. Simply add a `honey_bun` column to any table(s) you want (the type can be renamed), put a non-null value into this column for any row(s) that you will never select, and 💥! You now have a trap for an attacker who comes in and does an unwary `SELECT * FROM table`.
 
-Sticky Honey Bun alerts are simple - they just log information about who, what, where, when, etc. It is up to the alert processor to decide if the alert is legit and what action should be taken. It can be as simple as sending an email or as complicated as revoking the user access or locking everything down. Regardless, that consumer lives outside of the DB, and is yours to craft as you desire.
+Sticky Honey Bun alerts are simple - they just log information about who, what, where, when, etc. It is up to the alert processor to decide if the alert is legit and what action should be taken. Actions can be as simple as sending an email or as complicated as revoking the user access or locking everything down. Regardless, that processor lives outside of the DB, and is yours to craft as you desire.
+
+## Quick example
+
+```sql
+CREATE EXTENSION sticky_honey_bun;
+ALTER TABLE customers ADD COLUMN honey honey_bun;
+INSERT INTO customers (email, honey)
+VALUES ('do-not-touch@internal', 'public.customers.honey');
+```
+
+Now any `SELECT * FROM customers` that returns that row produces a
+one-line JSON alert in the configured log file:
+
+```json
+{"ts":"2026-05-25T04:11:36.205673Z","event":"read_text","tag":"public.customers.honey","session_user":"alice","client_addr":"10.0.4.7","query":"SELECT * FROM customers"}
+```
 
 ## End goals
 
 - **Tripwire detection** for unauthorized reads of specific rows in PostgreSQL, without forcing queries through views or stored procedures.
-- **Replica-safe**: side effects don't touch DB state, so traps can still fire on hot standbys (where attackers often go).
+- **Replica-safe**: side effects don't touch DB state, so traps can still fire on hot standbys.
 - **Does not require logging all queries** which is often a non-starter on busy dbs.
 - **Tamper-resistant** on self-hosted: the type I/O logic is in compiled C, not inspectable via `pg_proc.prosrc`.
 - **Cheap on the common path**: NULL values short-circuit the type I/O functions entirely; non-trap rows pay nothing.
-- **Self-describing alerts**: the stored value is itself a tag identifying which honey was tripped. A single shared type can plant traps in arbitrarily many tables.
+- **Self-describing alerts**: the stored value is itself a tag identifying which trap was tripped. Traps can live in as many tables and schemas as you desire.
 - **Deadman-protected**: a heartbeat stream keeps the alert processor honest about whether silence means "no attacks" or "logger is broken."
 - **Support for both self-hosted and hosted Postgres** by being flexible about the mechanics of the alert logging.
 
 ## Not goals
-- **Protection against writes** from malicious users. Removing rows, encrypting data, or inserting poisoned values - Sticky Honey Bun doesn't care about any of that.
-- **Unauthorized access**: Your database should be heavily firewalled and have a robust user authentication setup. Users should have proper permission controls. Sticky Honey Bun will not help with those defenses. By the time an attacker might encounter Sticky Honey Bun, they are already inside your database, accessing data.
-- **Protection against compromised admins**: If you can remove extensions, you can remove Sticky Honey Bun.
-- **Stopping exfiltration** is not a primary goal of Sticky Honey Bun, only detecting it and possibly taking action. If you have an attacker that can read a honeytoken, it is too late. The `terminate_on_read` GUC is a best-effort circuit breaker: when enabled, an in-flight bulk read is halted at the next inter-row interrupt check, so the leaked surface is bounded — but the trap is also unmasked to the attacker. Off by default.
-- **OS-level exfiltration**, such as file copies or restoring backups to an unmanaged server, is well beyond anything Sticky Honey Bun can even know about, much less take action on.
+- **Protection against writes** from malicious users. Removing rows, encrypting data, dropping tables, or inserting poisoned values — Sticky Honey Bun doesn't care about any of that.
+- **Replacing perimeter security.** Your database should be firewalled and have proper authentication and permission controls. By the time an attacker encounters Sticky Honey Bun, they're already inside the DB looking at real tables.
+- **Protection against compromised admins.** If you can remove extensions, you can remove Sticky Honey Bun. OS-level activity — copying heap files, restoring backups elsewhere — is beyond what the extension can see.
+- **Stopping exfiltration.** Detection is the goal; the `terminate_on_read` GUC is a best-effort circuit breaker (it halts the in-flight query at the next inter-row interrupt check) but it unmasks the trap to the attacker. Off by default.
 
 ## Where it sits in the landscape
 
@@ -32,26 +47,21 @@ existing tools don't fill:
 
 | Tool | What it is | Where it lives | Triggers on | Cost on common path |
 |---|---|---|---|---|
-| **Sticky Honey Bun** | column-level tripwire | inside real production tables | read of a planted honey row | ~0 (STRICT I/O short-circuits NULL) |
-| `pgAudit` | statement audit log | PG extension | every audited statement | per-statement overhead |
+| **Sticky Honey Bun** | column-level tripwire | inside real production tables | read of a planted honey row | ~0 |
+| `pgAudit` | statement audit log | PG extension | every audited statement | per-statement overhead, plus analysis |
 | Canarytokens (Thinkst) | external tokens (URLs, AWS keys, doc traps) | outside the DB | attacker *uses* the token later | 0 in-DB |
 | FDW decoys (e.g. PG Decoy) | table-level decoys | foreign tables that look real | `SELECT` against the decoy | 0 if attacker ignores the decoy |
 | Standalone DB honeypots | decoy database servers | separate infrastructure | attacker connects / explores | 0 (different system) |
 
-These are not either/or. A defensible setup runs `pgAudit` for the
-compliance / forensic trail, Canarytokens for post-exfiltration
-detection, and SHB as the in-engine tripwire layered on top — each
-catches a different attacker behavior:
-
-- `pgAudit`: "what happened?" (everything, after the fact)
-- Canarytokens: "did the stolen artifact get used somewhere?" (later)
-- SHB: "did someone touch the bait *right now*?" (immediately, inside PG)
-
-SHB's distinct contribution is the combination of read-time detection
-and zero-noise-from-application-traffic: legitimate queries that don't
-touch planted rows produce no log entries at all. It does NOT replace
-audit logging (`pgAudit` is for the full trail) or external token
-detection (Canarytokens covers what happens after the data leaves PG).
+These are not either/or. A layered setup runs `pgAudit` for the
+compliance trail, Canarytokens for post-exfiltration detection, and
+Sticky Honey Bun as the in-engine tripwire — three different attacker
+behaviors caught by three different mechanisms. Sticky Honey Bun's
+distinct contribution is **read-time detection inside real production
+tables** with zero noise on application traffic: queries that don't
+touch a planted row produce no log entries at all. The corollary is
+that nothing fires until an attacker is already touching your real
+data — which is exactly when you want to know.
 
 ## Repository layout
 
@@ -112,6 +122,145 @@ One JSON object per line (file) or per event (Lambda):
 | `query` | `debug_query_string` | Forensics; can be NULL in some internal call paths |
 | `cluster_id` | RDS variant only, set via `sticky_honey_bun_rds.cluster_id` GUC | Identifies the source cluster when one Lambda fans many in |
 
+Heartbeat lines carry only `ts`, `event` (always `"heartbeat"`), `tag`
+(always `"heartbeat"`), and `pid`. The bgworker has no database
+connection and no session, so the other fields are absent rather than
+null:
+
+```json
+{"ts":"2026-05-25T04:11:36.205673Z","event":"heartbeat","tag":"heartbeat","pid":23692}
+```
+
+## Usage
+
+The extension's install script revokes `USAGE` on the `honey_bun` type from `PUBLIC`,
+so planting honey columns and inserting honey values require either the
+extension-owner role (typically the superuser who ran `CREATE EXTENSION`)
+or an explicit `GRANT USAGE ON TYPE honey_bun TO planter_role`. Reading
+existing honey-bearing tables works for any role with `SELECT` and does
+not require `USAGE`.
+
+```sql
+-- One-time install on self-hosted PG (as superuser).
+CREATE EXTENSION sticky_honey_bun;
+
+-- Plant a honey column on a sensitive table. Requires USAGE on the type;
+-- the extension owner has this by default.
+ALTER TABLE public.customers ADD COLUMN honey honey_bun;
+CREATE INDEX idx_customer_honey ON public.customers (id) WHERE honey IS NOT NULL;
+
+-- Insert the trap row. Every legitimate row keeps honey=NULL.
+INSERT INTO customers (email, honey)
+VALUES ('do-not-touch@internal', 'public.customers.honey');
+
+-- Audit what's planted (superuser only by default — see below)
+SELECT * FROM honey_bun_columns;
+
+-- Verify behavior
+-- no alert is triggered
+SELECT * FROM customers WHERE honey IS NULL;
+
+-- triggers an alert
+SELECT * FROM customers WHERE honey is not null;
+```
+
+The honeytoken value is opaque to the extension — it's emitted verbatim
+into the alert log's `tag` field. The recommended convention is
+`schema.table.column`, which gives the alert processor and any audit
+tooling a predictable shape to parse. Use whatever convention suits
+your environment, just be consistent so downstream filtering stays
+simple.
+
+### Site-specific type names
+
+The `honey_bun` name is public. An attacker who reads these docs can `\dT honey_bun` to find the trap type. To make planted columns less
+discoverable, create site-specific aliases:
+
+```sql
+-- Register the alias type. Pick a name that fits your schema's vocabulary;
+-- the more it looks like real data, the less it stands out to an attacker.
+SELECT create_honey_bun_alias('account_token');
+-- or in another schema:
+SELECT create_honey_bun_alias('session_blob', 'auth');
+
+-- Plant a column of the aliased type. The COLUMN name (auth_token) is
+-- separate from the TYPE name (account_token); pick whichever combination
+-- blends best with the surrounding columns.
+ALTER TABLE customers ADD COLUMN auth_token account_token;
+INSERT INTO customers (id, email, auth_token)
+  VALUES (-1, 'do-not-touch@internal', 'public.customers.auth_token');
+```
+
+`create_honey_bun_alias` exists in **both the self-hosted and RDS variants**
+with the same SQL surface. The mechanisms differ:
+
+- **Self-hosted (C)**: each alias gets its own SQL-level I/O functions
+  bound to the same compiled C symbols, plus a full set of comparison
+  operators, btree/hash op classes, and `min`/`max` aggregates so
+  `DISTINCT`/`ORDER BY`/`MIN`/`MAX`/`GROUP BY` all work on aliased columns.
+- **RDS (pg_tle)**: each alias re-registers the type via
+  `pgtle.create_base_type` pointing at the same PL/pgSQL I/O functions.
+  A `honey_bun_registry` table tracks which types are honey-shaped so the
+  `honey_bun_columns` view can find them.
+
+Aliases trap identically to `honey_bun` and appear in `honey_bun_columns`.
+On self-hosted, aliases depend on the extension's C functions; `DROP EXTENSION
+sticky_honey_bun CASCADE` removes them along with everything else.
+
+### Locked-down inventory
+
+Sticky Honey Bun creates a view `honey_bun_columns` which enumerates every planted trap, including those under aliased type names. That is exactly the catalog an attacker who has landed in the database would want, so the install script revokes all access from `PUBLIC`. Only superusers (and the extension owner) can read it by default.
+
+To give a narrow audit role access:
+
+```sql
+CREATE ROLE shb_audit;
+GRANT SELECT ON honey_bun_columns TO shb_audit;
+GRANT shb_audit TO your_audit_user;
+```
+
+This is a high bar, not an impenetrable one. The view's underlying query
+(`pg_proc.prosrc = 'honey_bun_out'` joined against `pg_attribute` etc.)
+can be reconstructed from public catalog reads by anyone determined enough
+to look — but they have to know that's the symbol to look for. The
+restricted view closes the opportunistic-attacker path.
+
+## Self-hosted vs RDS
+
+| Concern | Self-hosted | RDS / Aurora |
+|---|---|---|
+| Packaging | C extension | PL/pgSQL extension via `pg_tle` |
+| Output sink | local file via C `write()` | `aws_lambda.invoke()` fire-and-forget |
+| Replica support | yes (file I/O works on standbys) | yes (Lambda invoke is an external HTTP call) |
+| Heartbeat source | extension bgworker | external poker (pg_cron is writer-only) |
+| Tamper resistance | strong — function bodies are compiled | weak — PL bodies are readable in `pg_proc` |
+| `honey_bun` SQL surface | identical | identical |
+| `create_honey_bun_alias` | yes (full operators + aggregates per alias) | yes (alias type only) |
+| `DISTINCT`/`ORDER BY`/`MIN`/`MAX` | yes | not without AWS extending pg_tle |
+| Log JSON shape | identical | identical |
+
+Both variants ship the same `honey_bun` type and emit the same JSON event
+shape, so a single alert processor (a reference exists in `tools/alert_monitor.py`) handles both.
+
+### Installing on RDS / Aurora
+
+Prerequisites on the cluster:
+- `pg_tle` extension (whitelist via `rds.allowed_extensions` /
+  `aurora.allowed_extensions` parameter group, then `CREATE EXTENSION pg_tle`).
+- `aws_lambda` extension.
+- IAM role on the RDS instance with `lambda:InvokeFunction` on the target
+  Lambda (deploy `lambda/handler.py`).
+- Custom GUCs `sticky_honey_bun_rds.lambda_arn` (required) and
+  `sticky_honey_bun_rds.cluster_id` (optional) set in the parameter group.
+
+```sh
+psql ... -f rds/sticky_honey_bun_rds.sql
+psql ... -c "CREATE EXTENSION sticky_honey_bun_rds"
+```
+
+Then plant honey columns the same way as the self-hosted variant. Validate
+with `rds/smoke_test.sh`.
+
 ## Configuration
 
 Sticky Honey Bun must be loaded via `shared_preload_libraries` so its GUCs are
@@ -124,7 +273,7 @@ shared_preload_libraries = 'sticky_honey_bun'
 ### GUCs (self-hosted)
 
 | Name | Type | Default | Description |
-|---|---|---|---|---|
+|---|---|---|---|
 | `sticky_honey_bun.log_path` | string | resolved from `log_directory` | Path to the alert file. Locked at server start to prevent a compromised superuser from redirecting writes (e.g. to `/dev/null`) via `ALTER SYSTEM`. Parent directory must exist. |
 | `sticky_honey_bun.enabled` | bool | `on` | Master kill switch. Locked at server start so a compromised superuser session cannot disable the trap via `ALTER SYSTEM`. |
 | `sticky_honey_bun.heartbeat_interval_seconds` | int (seconds) | `60` | Seconds between heartbeat lines from the bgworker. `0` disables heartbeats. Locked at server start to prevent runtime silencing. |
@@ -161,138 +310,6 @@ check inside `honey_bun_in_rds` (the PL/pgSQL analog of the C variant's
 the same way PG's native typinput dispatch does). Planter roles need an
 explicit `GRANT USAGE ON TYPE honey_bun` to insert honey values.
 
-## Usage
-
-The install script revokes `USAGE` on the `honey_bun` type from `PUBLIC`,
-so planting honey columns and inserting honey values require either the
-extension-owner role (typically the superuser who ran `CREATE EXTENSION`)
-or an explicit `GRANT USAGE ON TYPE honey_bun TO planter_role`. Reading
-existing honey-bearing tables works for any role with `SELECT` and does
-not require `USAGE`.
-
-```sql
--- One-time install on self-hosted PG (as superuser).
-CREATE EXTENSION sticky_honey_bun;
-
--- Plant a honey column on a sensitive table. Requires USAGE on the type;
--- the extension owner has this by default.
-ALTER TABLE public.customers ADD COLUMN honey honey_bun;
-CREATE INDEX idx_customer_honey ON public.customers (id) WHERE honey IS NOT NULL;
-
--- Insert the trap row. Every legitimate row keeps honey=NULL.
-INSERT INTO customers (email, honey)
-VALUES ('do-not-touch@internal', 'public.customers.honey');
-
--- Audit what's planted (superuser only by default — see below)
-SELECT * FROM honey_bun_columns;
-
--- Verify behavior
--- no alert is triggered
-SELECT * FROM customers WHERE honey IS NULL;
-
--- triggers an alert
-SELECT * FROM customers WHERE honey is not null;
-```
-
-The value of the honeytoken is opaque to the extension — it's there as context for you, to emitted
-verbatim into the alter log's `tag` field. The recommended convention is
-`schema.table.column`, as it gives the alert processor and any audit
-tooling a predictable shape to parse. But if that's not handy for your alert processor, pick whatever convention works for you.
-
-### Locked-down inventory
-
-`honey_bun_columns` enumerates every planted trap, including those under
-aliased type names. That is exactly the catalog an attacker who has landed
-in the database would want, so the install script revokes all access from
-`PUBLIC`. Only superusers (and the extension owner) can read it by default.
-
-To give a narrow audit role access:
-
-```sql
-CREATE ROLE shb_audit;
-GRANT SELECT ON honey_bun_columns TO shb_audit;
-GRANT shb_audit TO your_audit_user;
-```
-
-This is a high bar, not an impenetrable one. The view's underlying query
-(`pg_proc.prosrc = 'honey_bun_out'` joined against `pg_attribute` etc.)
-can be reconstructed from public catalog reads by anyone determined enough
-to look — but they have to know that's the symbol to look for. The
-restricted view closes the opportunistic-attacker path.
-
-### Site-specific type names
-
-The `honey_bun` name is public. An attacker who reads these docs can
-`\dT honey_bun` to find the trap type. To make planted columns less
-discoverable, create site-specific aliases:
-
-```sql
--- Register the alias type. Pick a name that fits your schema's vocabulary;
--- the more it looks like real data, the less it stands out to an attacker.
-SELECT create_honey_bun_alias('account_token');
--- or in another schema:
-SELECT create_honey_bun_alias('session_blob', 'auth');
-
--- Plant a column of the aliased type. The COLUMN name (auth_token) is
--- separate from the TYPE name (account_token); pick whichever combination
--- blends best with the surrounding columns.
-ALTER TABLE customers ADD COLUMN auth_token account_token;
-INSERT INTO customers (id, email, auth_token)
-  VALUES (-1, 'do-not-touch@internal', 'public.customers.auth_token');
-```
-
-`create_honey_bun_alias` exists in **both the self-hosted and RDS variants**
-with the same SQL surface. The mechanisms differ:
-
-- **Self-hosted (C)**: each alias gets its own SQL-level I/O functions
-  bound to the same compiled C symbols, plus a full set of comparison
-  operators, btree/hash op classes, and `min`/`max` aggregates so
-  `DISTINCT`/`ORDER BY`/`MIN`/`MAX`/`GROUP BY` all work on aliased columns.
-- **RDS (pg_tle)**: each alias re-registers the type via
-  `pgtle.create_base_type` pointing at the same PL/pgSQL I/O functions.
-  A `honey_bun_registry` table tracks which types are honey-shaped so the
-  `honey_bun_columns` view can find them.
-
-Aliases trap identically to `honey_bun` and appear in `honey_bun_columns`.
-On self-hosted, aliases depend on the extension's C functions; `DROP EXTENSION
-sticky_honey_bun CASCADE` removes them along with everything else.
-
-## Self-hosted vs RDS
-
-| Concern | Self-hosted | RDS / Aurora |
-|---|---|---|
-| Packaging | C extension | PL/pgSQL extension via `pg_tle` |
-| Output sink | local file via C `write()` | `aws_lambda.invoke()` fire-and-forget |
-| Replica support | yes (file I/O works on standbys) | yes (Lambda invoke is an external HTTP call) |
-| Heartbeat source | extension bgworker | external poker (pg_cron is writer-only) |
-| Tamper resistance | strong — function bodies are compiled | weak — PL bodies are readable in `pg_proc` |
-| `honey_bun` SQL surface | identical | identical |
-| `create_honey_bun_alias` | yes (full operators + aggregates per alias) | yes (alias type only) |
-| `DISTINCT`/`ORDER BY`/`MIN`/`MAX` | yes | not yet (no operators on PL-side types) |
-| Log JSON shape | identical | identical |
-
-Both variants ship the same `honey_bun` type and emit the same JSON event
-shape, so a single alert processor (`tools/alert_monitor.py`) handles both.
-
-### Installing on RDS / Aurora
-
-Prerequisites on the cluster:
-- `pg_tle` extension (whitelist via `rds.allowed_extensions` /
-  `aurora.allowed_extensions` parameter group, then `CREATE EXTENSION pg_tle`).
-- `aws_lambda` extension.
-- IAM role on the RDS instance with `lambda:InvokeFunction` on the target
-  Lambda (deploy `lambda/handler.py`).
-- Custom GUCs `sticky_honey_bun_rds.lambda_arn` (required) and
-  `sticky_honey_bun_rds.cluster_id` (optional) set in the parameter group.
-
-```sh
-psql ... -f rds/sticky_honey_bun_rds.sql
-psql ... -c "CREATE EXTENSION sticky_honey_bun_rds"
-```
-
-Then plant honey columns the same way as the self-hosted variant. Validate
-with `rds/smoke_test.sh`.
-
 ## Build
 
 ```sh
@@ -320,7 +337,11 @@ make docker-clean         # remove tagged images
 
 TAP tests under `t/*.pl` use `PostgreSQL::Test::Cluster` (PG 15+), which ships
 with `postgresql-server-dev-N` on Debian but is **not** bundled with Homebrew's
-PostgreSQL formula. Tests run inside docker for that reason.
+PostgreSQL formula. Tests run inside docker for that reason. The PG 14
+test module set was renamed (`PostgresNode` / `TestLib` →
+`PostgreSQL::Test::Cluster` / `PostgreSQL::Test::Utils`); `t/lib/SHB.pm`
+is a small shim that picks whichever is available, so the same tests run
+on PG 14 through 18.
 
 ```sh
 make docker-test-15        # run TAP suite against PG 15
@@ -363,7 +384,9 @@ behavior under test, and asserts against the log file or DB state.
 | `t/029_logical_replication.pl` | Publisher + subscriber: the subscription's apply worker materializes honey rows via `honey_bun_recv` (passing the C-level USAGE check when the subscription owner has USAGE) and subsequent subscriber-side reads fire the trap on the subscriber's own log |
 | `t/030_utf8_and_encoding.pl` | Multi-byte UTF-8 (Japanese, emoji, Cyrillic, Greek, Arabic, diacritics) in `tag` and in `query` round-trip verbatim through `escape_json`; all standard log fields are present on every line (field-stability regression guard) |
 | `t/031_recon_paths.pl` | Documents the recon paths open to a non-superuser (`pg_type`, `pg_proc.prosrc`, `pg_attribute` joins reconstruct the inventory) and the one closed path (`honey_bun_columns` view). Pins both states so future hardening or accidental loosening shows up as test churn |
-| `t/032_bgworker_resilience.pl` | Heartbeat bgworker is visible in `pg_stat_activity` with the expected `backend_type` and database, and is emitting heartbeats at the configured interval — the deadman's "is the trap alive?" signal |
+| `t/032_bgworker_resilience.pl` | Heartbeat bgworker is alive and emitting at the configured interval — heartbeat-emission is the only externally observable liveness signal because the SHMEM-only worker does not appear in `pg_stat_activity` |
+| `t/033_heartbeat_no_db.pl` | Heartbeat bgworker holds no database connection: dropping the `postgres` database does not break it; heartbeats continue and carry only the minimal `ts`/`event`/`tag`/`pid` fields appropriate for a process beacon |
+| `t/034_logical_replication_acls.pl` | Negative-path complement to `t/029`: subscription owner without `USAGE` on `honey_bun` stalls the apply worker (the C-level `pg_type_aclcheck` in `honey_bun_recv` fires from the replication path, not just direct casts); `GRANT USAGE` recovers the subscription |
 
 The RDS variant has a manual smoke test (`rds/smoke_test.sh`) since it
 requires a real RDS/Aurora cluster with `pg_tle` and `aws_lambda`.
@@ -472,11 +495,80 @@ Treat the alert log as PII-bearing for retention purposes. Specifically:
   90 days to 7 years depending on jurisdiction and use case).
 - A GDPR/CCPA right-to-erasure request that touches the subject's
   identifiers may require redaction of historical alerts.
-- The extension provides no built-in tamper-evidence — a compromised
-  superuser with OS-level access can edit the log file. If that matters
-  for compliance, ship the log to a write-once external sink (S3 with
-  object lock, CloudWatch Logs, Splunk HEC, etc.) and keep the local
-  copy as a cache only.
+- The extension provides no built-in tamper-evidence on the local log
+  file — see the next section for why and for what to do about it.
+
+### Durability and tamper-evidence
+
+The local alert log is best-effort. In-file cryptographic integrity
+(hash chains, signatures) is deliberately *not* implemented because the
+threat model doesn't make it useful:
+
+- An attacker with write access to the log file is already either the
+  `postgres` OS user or root, which means they can read every heap file
+  in `DataDir` directly. They don't need to bother going through the
+  trap; they `cp -r $PGDATA/base/...` and bypass SQL entirely. The
+  tampered log records no event they ever fired.
+- A SQL-level attacker can't reach the file at all — the REVOKEs and
+  C-level USAGE checks documented above close off the forge primitive
+  from their reach.
+
+Real durability and compliance-grade tamper-evidence come from shipping
+each alert line to an external append-only sink as it's written. The
+extension's job ends at "one JSON line on disk"; everything past that is
+the operator's choice of pipeline.
+
+Common shipping options, roughly ordered by integration cost:
+
+**Third-party log SaaS** — Observe, Sumo Logic, Splunk Cloud, Datadog,
+Honeycomb, Logz.io, New Relic Logs, etc. The vendor's agent (or a
+generic `fluent-bit` / `vector`) tails `sticky_honey_bun.log` and ships
+over HTTPS. Turnkey; full-text search and alerting included; no infra to
+maintain. Costs scale with ingest volume — a bulk `pg_dump` of a
+honey-bearing table inflates that meaningfully, so verify the vendor's
+billing model and confirm their retention has an immutability /
+append-only mode if you care about compliance.
+
+**AWS CloudWatch Logs** — `cloudwatch-agent` or `awslogs` tails the file
+and writes to a log group. IAM-gated, supports metric filters for
+alarms, and retention is per-log-group. Note CloudWatch on its own
+isn't strictly immutable; if you need write-once semantics, pair it
+with a subscription filter that delivers to S3 with object lock.
+
+**S3 with object lock (compliance mode)** — Rotate the local file
+(logrotate's `dateext` works fine) and upload each rotation to a
+versioned, object-locked bucket. Cheapest at high volume and gives
+genuine write-once retention. The trade-off is that the
+event-to-shipped latency is the rotation interval, so this is good for
+the durable archive but should be paired with something real-time
+(a SaaS or CloudWatch tail) for live alerting.
+
+**Remote syslog / rsyslog / journald forwarding** — local `rsyslog`
+reads the file via `imfile` and forwards to a remote collector or
+SIEM. Standard Linux tooling, near-zero cost, good fit for on-prem.
+Use TCP/TLS via RFC 5425 or RELP in production — the default UDP path
+is lossy and unauthenticated.
+
+**Self-hosted log stack** — Elasticsearch + Filebeat, Loki + Promtail,
+Vector + ClickHouse, etc. Full control, no per-GB SaaS bill, you also
+own the cluster's storage and retention story (including whatever
+immutability guarantees your backend gives you).
+
+Whichever sink you pick, two operational properties matter more than
+the brand:
+
+- **Append-only / write-once at the sink itself.** The whole point is
+  that an attacker who can corrupt the local file cannot reach the
+  sink. A SaaS that lets the customer delete arbitrary lines via the
+  UI doesn't satisfy this; a sink with role-based deletion that
+  requires a second human (or that's literally write-once at the
+  storage layer) does.
+- **Shipping latency under burst load.** A bulk read of a
+  honey-bearing table produces one event per row. If the shipper
+  buffers or backpressures during the burst, that's the window during
+  which a tamper would go unrecorded on the durable side. Pick a sink
+  whose ingest characteristics handle your worst-case burst, and
+  size the local-file rotation around the same number.
 
 ### Capacity guidance
 
@@ -563,7 +655,7 @@ weekly fallback.
   in practice.
 
 - **The log file's parent directory must exist.** The extension creates the
-  file but does not `mkdir -p` its parents. On macOS Homebrew PG the default
+  file but does not `mkdir -p` its parents. The default
   resolution chain may point at a directory that does not exist (because
   `log_directory` is set but `logging_collector` is off). Set
   `sticky_honey_bun.log_path` explicitly in production.
@@ -571,81 +663,42 @@ weekly fallback.
 - **The log file is owned by the postgres OS user.** Configure your log
   shipper to read it via group membership rather than running as root.
 
-- **The bgworker connects to the `postgres` database.** Heartbeat events log
-  the regular fields (which are mostly empty for the bgworker context, since
-  there's no real session). If you've dropped the `postgres` database, the
-  bgworker will fail to start.
+- **The bgworker has no database connection.** It writes heartbeat lines
+  directly via the alert path — no session, no transaction, no syscache
+  access. Two operational consequences: heartbeat lines carry only
+  `ts`/`event`/`tag`/`pid` (the other JSON fields are absent, not null),
+  and the worker does NOT appear in `pg_stat_activity` — heartbeat
+  emission is the only externally observable liveness signal.
 
-- **The bgworker also calls `shb_log_event`**, so flipping
-  `sticky_honey_bun.enabled = off` mutes heartbeats too. That can look like
-  a deadman alert at the monitor if you forget. Tests that flip the kill
-  switch should also disable heartbeats explicitly.
+- **`sticky_honey_bun.enabled = off` mutes heartbeats too.** The same
+  master switch gates both trap events and the bgworker's heartbeat. That
+  can look like a deadman alert at the monitor if you forget. Tests that
+  flip the kill switch should also disable heartbeats explicitly.
 
 - **ORM/driver awareness is limited.** Most drivers treat `honey_bun` as an
   unknown OID and either error or fall back to text. For honey columns this
   is fine because no application code should be reading them anyway.
 
-- **Logical replication subscribers need the extension installed.** If you
-  replicate a table containing a `honey_bun` column, the subscriber must
-  also have the extension. Otherwise it cannot decode incoming rows.
+- **Logical replication subscribers need the extension AND `USAGE` on
+  `honey_bun`.** The subscriber's table needs the type to exist
+  (otherwise the column definition is invalid), and the apply worker
+  needs `USAGE` to materialize incoming row values via `honey_bun_recv`
+  (the C-level `pg_type_aclcheck` fires for the subscription role like
+  any other caller). `GRANT USAGE` on the subscriber to whichever role
+  owns the subscription.
 
 - **`terminate_on_read` only fires from ordinary client backends.** Parallel
   workers and walsenders execute the same type I/O code but are spared the
   SIGTERM, so logical replication keeps flowing on the publisher and parallel
   plans don't deadlock partway through. The alert still fires from those
   paths; only the termination is suppressed. In practice the leader is where
-  result-row typoutput runs for a normal `SELECT *`, so the bulk-exfil case
+  result-row typoutput runs for a normal `SELECT *`, so the exfiltration case
   is covered.
 
 - **The `honey_bun_out` function may be invoked more than once per row.**
   PostgreSQL does not guarantee exactly-once invocation of `typoutput`. Treat
   log entries as "at least one access," not a precise count. Dedup at the
   alert processor using `pid` and the transaction start.
-
-- **Forge-an-alert primitive is closed at three layers.** First, `EXECUTE`
-  is revoked from `PUBLIC` on all four I/O functions (and on every
-  alias-generated set from `create_honey_bun_alias()`), so direct
-  `SELECT honey_bun_out('forged'::honey_bun)` errors with permission
-  denied. Second, `USAGE` is revoked from `PUBLIC` on the `honey_bun`
-  type (and every alias type), so a non-superuser cannot `CREATE TABLE
-  forge (h honey_bun)` to plant their own honey row. Third — and this
-  is the load-bearing layer — `honey_bun_in` and `honey_bun_recv`
-  perform their own `pg_type_aclcheck` in C, refusing to construct a
-  value if the caller lacks `USAGE` on the destination type. PG itself
-  does not check function ACLs on typinput dispatch (the path used by
-  `'literal'::sometype` casts and by INSERT typecoercion), so without
-  this C-level guard a non-superuser could still write
-  `SELECT 'forged'::honey_bun;` and let result-row typeoutput dispatch
-  fire the trap with attacker-chosen tag. The trap on existing planted
-  columns is unaffected: reading a row does not invoke `honey_bun_in`,
-  so `USAGE` is not required for legitimate trap fires. Operators who
-  want a specific role to be able to plant honey columns or insert into
-  honey-bearing tables should `GRANT USAGE ON TYPE honey_bun TO that_role`.
-
-- **Logical replication subscribers need `USAGE` on `honey_bun` (and on
-  any alias types being replicated).** The apply worker calls `honey_bun_recv`
-  to materialize incoming row values; the C-level USAGE check fires for the
-  subscription role just like any other caller. `GRANT USAGE` to the
-  subscription role on the subscriber cluster.
-
-- **The log path is resolved once at server start and frozen for the life
-  of the postmaster.** `log_directory` is `PGC_SIGHUP`, so without this an
-  attacker with `ALTER SYSTEM` could redirect alerts via the resolve
-  fallback path even though `sticky_honey_bun.log_path` itself is
-  `PGC_POSTMASTER`. Runtime changes to `log_directory` have no effect on
-  where alerts are written.
-
-- **The logger opens the alert file with `O_NOFOLLOW`.** If the file at
-  the configured path is a symlink (an attacker with parent-directory
-  write may have swapped it to redirect alerts), the open fails and the
-  event is silently dropped per the project's "broken log path must not
-  surface as a SELECT error" rule. The symlink and its target are not
-  modified.
-
-- **Cross-version test plumbing**. The Perl test modules renamed between
-  PG 14 (`PostgresNode` / `TestLib`) and PG 15 (`PostgreSQL::Test::Cluster` /
-  `PostgreSQL::Test::Utils`). `t/lib/SHB.pm` is a small shim that picks the
-  available module set, so all `t/*.pl` tests work on PG 14 through 18.
 
 - **The RDS variant's PL/pgSQL bodies are readable** via `pg_proc`. Anyone
   with `pg_read_all_data` (which `rds_superuser` has) can inspect them. This

@@ -1,0 +1,27 @@
+ARG PG_MAJOR=15
+FROM postgres:${PG_MAJOR}
+
+ARG PG_MAJOR
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PG_CONFIG=/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        postgresql-server-dev-${PG_MAJOR} \
+        libkrb5-dev \
+        libipc-run-perl \
+        libtest-simple-perl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . /src/
+
+RUN make clean >/dev/null 2>&1 || true
+RUN make local
+RUN make install
+
+# PG won't initdb/run as root; tests spin up their own ephemeral cluster.
+RUN chown -R postgres:postgres /src
+USER postgres
+RUN make installcheck

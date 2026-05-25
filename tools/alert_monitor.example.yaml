@@ -1,0 +1,44 @@
+# Sticky Honey Bun alert monitor configuration.
+#
+# Run: python3 tools/alert_monitor.py --config alert_monitor.yaml
+
+# Path to the alert log file emitted by the extension (self-hosted) or
+# whatever sink your RDS Lambda forwards to.
+log_path: /var/log/postgresql/sticky_honey_bun.log
+
+# Connection string to the primary. Used to ALTER ROLE NOLOGIN and
+# pg_terminate_backend() the offending sessions when a real alert fires.
+# Required when dry_run is false.
+primary_dsn: postgresql://shb_monitor@primary.example.internal:5432/postgres
+
+# Refuse to take action; log what would have happened. Flip to false once
+# you've validated the suppression rules end-to-end in your environment.
+dry_run: true
+
+# Optional: POST every alert (and deadman events) as JSON to this URL.
+# webhook_url: https://hooks.example/shb
+
+# Maximum age of the most recent heartbeat before raising a deadman alert.
+# Should comfortably exceed sticky_honey_bun.heartbeat_interval_seconds.
+heartbeat_max_age_seconds: 300
+
+# How often to poll the log file for new lines.
+poll_interval_seconds: 1.0
+
+# Tag prefix used to identify external-poker heartbeats (the bgworker uses
+# event=heartbeat directly and doesn't need this).
+heartbeat_tag_prefix: sticky_honey_bun.heartbeat
+
+# Suppression rules. An event is suppressed if it matches ANY rule, and a
+# rule matches only if ALL listed fields equal the event's. Set fields to
+# null/omit to ignore them.
+#
+# Filter primarily on session_user + client_addr. Do NOT filter on
+# application_name (spoofable via PGAPPNAME).
+suppressions:
+  - session_user: backup_role
+    client_addr: 10.0.1.42
+    note: "nightly pg_dump from backup orchestrator"
+
+  - session_user: replication_role
+    note: "logical replication walsender"

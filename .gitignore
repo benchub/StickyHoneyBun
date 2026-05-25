@@ -1,0 +1,12 @@
+*.o
+*.so
+*.dylib
+*.bc
+*.bz2
+src/*.o
+results/
+regression.diffs
+regression.out
+log/
+tmp_check/
+.DS_Store

@@ -1,0 +1,10 @@
+*.o
+*.so
+*.dylib
+*.bc
+src/*.o
+results/
+regression.diffs
+regression.out
+.git/
+.gitignore

@@ -1,0 +1,5 @@
+comment = 'Sticky Honey Bun: honeytoken data type for tripwire detection'
+default_version = '1.0'
+module_pathname = '$libdir/sticky_honey_bun'
+relocatable = true
+superuser = true

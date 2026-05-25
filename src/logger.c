@@ -1,0 +1,185 @@
+#include "postgres.h"
+
+#include <fcntl.h>
+#include <netdb.h>
+#include <sys/file.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <time.h>
+#include <unistd.h>
+
+#include "commands/dbcommands.h"
+#include "libpq/libpq-be.h"
+#include "miscadmin.h"
+#include "tcop/tcopprot.h"
+#include "utils/builtins.h"
+#include "utils/guc.h"
+#include "utils/json.h"
+
+#include "sticky_honey_bun.h"
+
+#define SHB_DEFAULT_FILENAME "sticky_honey_bun.log"
+#define SHB_FALLBACK_DIR     "/var/log/postgresql"
+
+static char *shb_log_path = NULL;
+static bool  shb_enabled  = true;
+
+void
+shb_register_gucs(void)
+{
+    DefineCustomStringVariable(
+        "sticky_honey_bun.log_path",
+        "Path to the Sticky Honey Bun alert log file.",
+        "Defaults to <log_directory>/" SHB_DEFAULT_FILENAME " if log_directory "
+        "is set, else " SHB_FALLBACK_DIR "/" SHB_DEFAULT_FILENAME ". "
+        "PGC_POSTMASTER: locked at server start so a compromised superuser "
+        "cannot redirect alert writes (e.g. to /dev/null) via ALTER SYSTEM.",
+        &shb_log_path,
+        NULL,
+        PGC_POSTMASTER,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "sticky_honey_bun.enabled",
+        "Master switch for honeytoken logging.",
+        "When false, honey_bun reads do not produce log entries. "
+        "PGC_POSTMASTER: can only be set in postgresql.conf at server "
+        "start; a compromised superuser session cannot disable the trap "
+        "via ALTER SYSTEM.",
+        &shb_enabled,
+        true,
+        PGC_POSTMASTER,
+        0,
+        NULL, NULL, NULL);
+}
+
+static char *
+resolve_log_path(void)
+{
+    const char *dir;
+
+    if (shb_log_path && shb_log_path[0])
+        return pstrdup(shb_log_path);
+
+    dir = GetConfigOption("log_directory", true, false);
+    if (dir && dir[0])
+    {
+        if (dir[0] == '/')
+            return psprintf("%s/%s", dir, SHB_DEFAULT_FILENAME);
+        return psprintf("%s/%s/%s", DataDir, dir, SHB_DEFAULT_FILENAME);
+    }
+
+    return psprintf("%s/%s", SHB_FALLBACK_DIR, SHB_DEFAULT_FILENAME);
+}
+
+static void
+get_client_addr(char *out, size_t outlen)
+{
+    if (!MyProcPort)
+    {
+        snprintf(out, outlen, "internal");
+        return;
+    }
+    if (MyProcPort->raddr.addr.ss_family == AF_UNIX)
+    {
+        snprintf(out, outlen, "local");
+        return;
+    }
+    if (getnameinfo((struct sockaddr *) &MyProcPort->raddr.addr,
+                    MyProcPort->raddr.salen,
+                    out, outlen, NULL, 0, NI_NUMERICHOST) != 0)
+        snprintf(out, outlen, "unknown");
+}
+
+static void
+append_kv_str(StringInfo buf, const char *key, const char *value, bool first)
+{
+    if (!first)
+        appendStringInfoChar(buf, ',');
+    appendStringInfoChar(buf, '"');
+    appendStringInfoString(buf, key);
+    appendStringInfoString(buf, "\":");
+    if (value)
+        escape_json(buf, value);
+    else
+        appendStringInfoString(buf, "null");
+}
+
+static void
+append_kv_int(StringInfo buf, const char *key, long long value, bool first)
+{
+    if (!first)
+        appendStringInfoChar(buf, ',');
+    appendStringInfo(buf, "\"%s\":%lld", key, value);
+}
+
+static void
+do_log_event(const char *event, const char *tag)
+{
+    char           *path;
+    int             fd;
+    struct timeval  tv;
+    struct tm       tm_utc;
+    char            ts[32];
+    char            client[NI_MAXHOST];
+    StringInfoData  line;
+
+    path = resolve_log_path();
+    fd = open(path, O_WRONLY | O_APPEND | O_CREAT, 0640);
+    pfree(path);
+    if (fd < 0)
+        return;
+
+    /*
+     * O_APPEND atomicity is only guaranteed up to PIPE_BUF (4 KB on Linux);
+     * a long debug_query_string can push the JSON line over that. flock the
+     * fd before writing so concurrent backends serialize cleanly. The lock
+     * releases automatically on close() below.
+     */
+    (void) flock(fd, LOCK_EX);
+
+    gettimeofday(&tv, NULL);
+    gmtime_r(&tv.tv_sec, &tm_utc);
+    strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_utc);
+    get_client_addr(client, sizeof(client));
+
+    initStringInfo(&line);
+    appendStringInfoChar(&line, '{');
+    appendStringInfo(&line, "\"ts\":\"%s.%06ldZ\"", ts, (long) tv.tv_usec);
+    append_kv_str(&line, "event", event, false);
+    append_kv_str(&line, "tag", tag, false);
+    append_kv_str(&line, "session_user",
+                  GetUserNameFromId(GetSessionUserId(), true), false);
+    append_kv_str(&line, "current_user",
+                  GetUserNameFromId(GetUserId(), true), false);
+    append_kv_str(&line, "application_name",
+                  GetConfigOption("application_name", true, false), false);
+    append_kv_str(&line, "database", get_database_name(MyDatabaseId), false);
+    append_kv_int(&line, "pid", MyProcPid, false);
+    append_kv_str(&line, "client_addr", client, false);
+    append_kv_str(&line, "query", debug_query_string, false);
+    appendStringInfoChar(&line, '}');
+    appendStringInfoChar(&line, '\n');
+
+    (void) write(fd, line.data, line.len);
+    close(fd);
+    pfree(line.data);
+}
+
+void
+shb_log_event(const char *event, const char *tag)
+{
+    if (!shb_enabled)
+        return;
+
+    PG_TRY();
+    {
+        do_log_event(event, tag);
+    }
+    PG_CATCH();
+    {
+        FlushErrorState();
+    }
+    PG_END_TRY();
+}

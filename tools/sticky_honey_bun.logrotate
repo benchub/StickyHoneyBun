@@ -1,0 +1,30 @@
+# logrotate(8) configuration for the Sticky Honey Bun alert file.
+#
+# Install:
+#   cp tools/sticky_honey_bun.logrotate /etc/logrotate.d/sticky_honey_bun
+#   chmod 0644 /etc/logrotate.d/sticky_honey_bun
+#
+# Then adjust the path on the first line to match your
+# sticky_honey_bun.log_path GUC. Logrotate will reject the file if the
+# postgres user doesn't own it; the `create` directive below recreates it
+# with the right owner+mode after each rotation.
+#
+# Why this config works without an SIGHUP / fd-reopen step:
+#   The extension opens/writes/closes the alert file per event, so there
+#   is no long-lived fd to invalidate. After logrotate moves the file out
+#   and the `create` directive makes a fresh empty one, the next trap
+#   write opens that new file at the same path. No data loss window.
+#
+# Do NOT switch this to `copytruncate` mode. That mode has a short window
+# between `cp` and `truncate` where in-flight writes can be lost, and the
+# `create` path above is strictly better here.
+
+/var/log/postgresql/sticky_honey_bun.log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 postgres postgres
+}

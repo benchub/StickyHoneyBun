@@ -88,7 +88,7 @@ numbered test under the same number block.
 | 004 binary_trip | ✓ | ✓ | pg_tle base types have no typsend; `COPY ... TO STDOUT BINARY` errors with "no binary output function" and the trap is NOT fired. The RDS test documents this as the expected (and operationally-relevant) behavior |
 | 005 pg_dump_trip | ✓ | ✓ | `pg_dump --data-only` against RDS dispatches typeoutput via COPY |
 | 006 tag_discrimination | ✓ | ✓ | Direct port |
-| 007 kill_switch | ✓ | →802 | RDS has no `enabled` GUC; uses `DELETE FROM sticky_honey_bun_rds_config` instead |
+| 007 kill_switch | ✓ | →802, →806 | RDS has no GUC; 802 tests the "remove the destination" kill (`DELETE lambda_arn`); 806 tests the explicit `enabled=off` kill, which is the closer analog to self-hosted's `sticky_honey_bun.enabled` GUC |
 | 008 inventory | ✓ | ✓ | Shared: `assert_inventory_lists_columns` (schema-filtered) |
 | 009 heartbeat | ✓ | →803 | No bgworker on RDS; uses external `tools/heartbeat_poker.sh` |
 | 010 alias_type | ✓ | ✓ | `create_honey_bun_alias` works in both variants |
@@ -96,7 +96,7 @@ numbered test under the same number block.
 | 012 partial_index | ✓ | ✓ | Index build uses typcmp (not typeoutput) — silent in both variants |
 | 013 inventory_lockdown | ✓ | ✓ | Shared: `assert_inventory_locked_from_role` |
 | 014 long_query | ✓ | ✓ | 16 KB query padding fits in both the local log line and Lambda's 256 KB async-invocation payload |
-| 015 concurrent_writes | ✓ | — | Concurrency semantics are the same; not exercised on a managed `db.t4g.micro` for cost |
+| 015 concurrent_writes | ✓ | ✓ | Self-hosted asserts flock prevents log-line interleaving; RDS asserts N concurrent reads each produce their own CloudWatch event (no Lambda Event-mode drops at modest concurrency) |
 | 016 terminate_on_read | ✓ | — | RDS has no `terminate_on_read` (the C extension's PGC_POSTMASTER bool); no analog mechanism in pg_tle |
 | 017 query_injection | ✓ | ✓ | Shared: `assert_alert_fields`; JSON-corrupting comment bytes |
 | 018 io_function_acl | ✓ | ✓ | Shared: `assert_io_function_call_denied`; `honey_bun_out_rds` vs `honey_bun_out` / `honey_bun_send` |
@@ -108,7 +108,7 @@ numbered test under the same number block.
 | 024 field_injection | ✓ | ✓ | Direct port; `tag` and `application_name` round-trip |
 | 025 log_permission_denied | ✓ | ✓ | RDS analog: an unreachable Lambda (bogus `lambda_arn`). The `EXCEPTION WHEN OTHERS THEN NULL` block in `honey_bun_out_rds` keeps the failure invisible to the caller — SELECT succeeds, returns rows, no error reaches the client |
 | 026 log_rotation | ✓ | — | No log file on RDS |
-| 027 red_team | ✓ | partial | Vectors targeting self-hosted-only surfaces (`ALTER SYSTEM`, GUC kill switch, `log_directory`) are not applicable to RDS |
+| 027 red_team | ✓ | ✓ | Each variant runs the cross-variant attack vectors (direct calls, casts, CREATE TABLE, inventory enumeration) via the shared lib, plus its own variant-specific vectors: self-hosted adds the ALTER SYSTEM defenses (enabled-GUC flip, log_directory redirect); RDS adds the config-table tamper vectors (SELECT/UPDATE/DELETE/INSERT, kill-switch INSERT). Both end with the legitimate-read regression check |
 | 028 streaming_replica | ✓ | →805 | The harness now provisions a read replica alongside the primary. The RDS-side concern is captured by 805 (a richer test that uses the replica as setup and pins the `server_addr` field as the per-node identifier) |
 | 029 logical_replication | ✓ | — | Logical-rep orchestration across two RDS instances not yet wired |
 | 030 utf8_and_encoding | ✓ | ✓ | Direct port; multi-byte UTF-8 in `tag` + `query` + `application_name` |
@@ -116,8 +116,12 @@ numbered test under the same number block.
 | 032 bgworker_resilience | ✓ | — | No bgworker on RDS |
 | 033 heartbeat_no_db | ✓ | — | No bgworker on RDS |
 | 034 logical_replication_acls | ✓ | — | Same as 029 |
+| 035 vacuum_analyze | ✓ | ✓ | ANALYZE and VACUUM walk the relation through typcmp / the storage layer, not typeoutput — neither fires the trap |
+| 036 set_role_detection | ✓ | ✓ | After `SET ROLE`, the alert carries `session_user` (immune) and `current_user` (role-switched) separately. RDS variant reconstructs `current_user` via `current_setting('role')` because `honey_bun_out_rds` is SECURITY DEFINER and would otherwise report the function owner |
+| 037 logical_rep_needs_extension | ✓ | — | Docker-only: subscriber without the extension cannot declare a `honey_bun` column; an operator who stubs the column as `text` to keep replication flowing creates an inert text-only mirror with no subscriber-side trap. Failure mode is in PG's type system, identical across variants — testing on RDS would require a second instance for no new coverage |
 | 801 cluster_id | — | ✓ | RDS-only: per-database config-table `cluster_id` differentiation |
 | 802 config_kill_switch | — | ✓ | RDS-only: `DELETE FROM sticky_honey_bun_rds_config` silences the trap (parallels 007) |
 | 803 external_heartbeat | — | ✓ | RDS-only: `tools/heartbeat_poker.sh` against the cluster produces alerts (parallels 009) |
 | 804 config_tamper_resistance | — | ✓ | RDS-only: app role cannot SELECT/UPDATE/DELETE/INSERT on the config table; SECURITY DEFINER read by the trap function still works (parallels 019) |
 | 805 server_addr | — | ✓ | RDS-only: the alert payload's `server_addr` field identifies which node within a cluster fired the trap (primary vs read replica). `cluster_id` is shared across nodes because the config table is WAL-replicated, so `server_addr` is the load-bearing per-node identifier |
+| 806 enabled_kill_switch | — | ✓ | RDS analog of self-hosted 007: the locked-down `sticky_honey_bun_rds_config` row `enabled='off'` silences the trap; only the extension owner can flip it (an app role's UPDATE attempt is permission-denied) |

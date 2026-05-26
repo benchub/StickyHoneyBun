@@ -309,18 +309,24 @@ REVOKE ALL ON sticky_honey_bun_rds_config FROM PUBLIC;
 |---|---|
 | `lambda_arn` | ARN of the Lambda to invoke on trap events. Required for alerts to fire; absent or empty disables alerting (the trap returns the tag transparently). |
 | `cluster_id` | Optional identifier emitted in the payload so a shared Lambda can route by source cluster. |
+| `enabled` | Optional owner-controlled kill switch. Absent or anything that isn't one of `off` / `false` / `0` / `no` is treated as enabled. When set to a disable value, the trap returns the tag without firing the Lambda. |
 
 The output function `honey_bun_out_rds` runs `SECURITY DEFINER` and reads
 this table as the extension owner. PUBLIC has no `SELECT`, `INSERT`,
 `UPDATE`, or `DELETE` on the config table, so an attacker session cannot
-read the Lambda ARN, cannot silence the trap by emptying it, and cannot
-redirect alerts by overwriting it. Configuration changes go through the
-extension owner.
+read the Lambda ARN, cannot silence the trap by emptying it, cannot
+redirect alerts by overwriting it, and cannot flip the `enabled` switch.
+Configuration changes go through the extension owner.
 
-The RDS variant intentionally has no `enabled` kill switch. To disable
-the trap, `DROP EXTENSION sticky_honey_bun_rds` (auditable infrastructure
-activity) or `DELETE FROM sticky_honey_bun_rds_config WHERE key =
-'lambda_arn'` as the owner.
+The `enabled` switch is the locked-down-table analog of the self-hosted
+`sticky_honey_bun.enabled` GUC. An earlier version of the RDS variant
+deliberately omitted a kill switch because custom-namespace GUCs would
+have been per-session-settable by attackers — but the config table
+closes that escape: only the extension owner can flip `enabled`, and
+the trap reads it via SECURITY DEFINER regardless of caller. To disable
+the trap an operator can either flip `enabled` (cheap, reversible) or
+`DROP EXTENSION sticky_honey_bun_rds` (more auditable infrastructure
+activity).
 
 The RDS install script mirrors the self-hosted lockdown wherever the
 mechanism translates from C to PL/pgSQL:
@@ -369,82 +375,47 @@ make docker-clean         # remove tagged images
 
 ## Tests
 
-TAP tests under `t/variants/self-hosted/*.pl` use `PostgreSQL::Test::Cluster` (PG 15+), which ships
-with `postgresql-server-dev-N` on Debian but is **not** bundled with Homebrew's
-PostgreSQL formula. Tests run inside docker for that reason. The PG 14
-test module set was renamed (`PostgresNode` / `TestLib` →
-`PostgreSQL::Test::Cluster` / `PostgreSQL::Test::Utils`); `t/lib/SHB.pm`
-is a small shim that picks whichever is available, so the same tests run
-on PG 14 through 18.
+Tests are organized under `t/variants/`, with a sub-directory per
+variant (`self-hosted/` and `rds/`) and shared assertion bodies in
+`t/lib/SHB_Assertions.pm`. The file-level conventions, the per-concern
+**coverage matrix** (which concerns are tested in which variants and
+which are intentionally skipped), and the guidance for adding new
+tests all live in **[`t/variants/README.md`](t/variants/README.md)**.
+
+Self-hosted suite (uses `PostgreSQL::Test::Cluster`, runs in docker
+because the Perl module isn't on Homebrew):
 
 ```sh
 make docker-test-15        # run TAP suite against PG 15
-make docker-test-matrix    # run against PG 15, 16, 17, 18
+make docker-test-matrix    # run against PG 14, 15, 16, 17, 18
+make docker-test-ubsan-15  # PG 15 with UBSAN-instrumented extension
 ```
 
-Each test file spins up an ephemeral cluster, configures the GUCs, runs the
-behavior under test, and asserts against the log file or DB state.
-
-### Coverage
-
-| File | What it asserts |
-|---|---|
-| `t/variants/self-hosted/001_install.pl` | `CREATE EXTENSION` registers the type; log-path GUC honored |
-| `t/variants/self-hosted/002_null_bypass.pl` | NULL honey values produce no log output |
-| `t/variants/self-hosted/003_text_trip.pl` | Text-protocol reads emit `read_text` with expected JSON fields |
-| `t/variants/self-hosted/004_binary_trip.pl` | `COPY TO BINARY` exercises `typsend`, emits `read_binary` |
-| `t/variants/self-hosted/005_pg_dump_trip.pl` | `pg_dump` fires the trap; logged query shows the `COPY` |
-| `t/variants/self-hosted/006_tag_discrimination.pl` | Distinct planted tags produce distinct log entries |
-| `t/variants/self-hosted/007_kill_switch.pl` | `enabled = off` suppresses entries; re-enabling resumes them |
-| `t/variants/self-hosted/008_inventory.pl` | `honey_bun_columns` view tracks planted columns and DROPs |
-| `t/variants/self-hosted/009_heartbeat.pl` | Bgworker emits heartbeats; setting interval to 0 stops them |
-| `t/variants/self-hosted/010_alias_type.pl` | `create_honey_bun_alias()` makes a site-specific type that traps identically and shows up in the inventory |
-| `t/variants/self-hosted/011_select_shapes.pl` | Trap fires for `SELECT *`, `WHERE`, `LIMIT`, `DISTINCT`, `MIN`/`MAX`, `GROUP BY`, `ORDER BY`; does not fire for `count(col)` or subqueries that project the column away |
-| `t/variants/self-hosted/012_partial_index.pl` | `CREATE INDEX ... WHERE honey IS NOT NULL` succeeds on honey_bun and on aliased types; building the index does not fire the trap; indexed reads do |
-| `t/variants/self-hosted/013_inventory_lockdown.pl` | Non-superusers cannot SELECT from `honey_bun_columns`; explicit GRANT to an audit role works |
-| `t/variants/self-hosted/016_terminate_on_read.pl` | `terminate_on_read = on` kills the reading backend after the log line is written; heartbeat bgworker survives; `ALTER SYSTEM` + reload cannot enable it at runtime |
-| `t/variants/self-hosted/017_query_injection.pl` | SQL-comment payloads shaped to forge a second JSON event (close-brace + open-brace sequences, embedded newlines, control chars) cannot corrupt the log: every line stays valid JSON with the legitimate `event`/`tag` values |
-| `t/variants/self-hosted/018_io_function_acl.pl` | Direct calls to `honey_bun_out`/`honey_bun_send` (and the alias-generated `_out`/`_send`) are blocked for non-superusers with permission denied; the real trap fires via typeoutput dispatch regardless of the function ACL |
-| `t/variants/self-hosted/019_log_path_frozen.pl` | Resolved log path is captured at postmaster start; runtime `ALTER SYSTEM SET log_directory` + `pg_reload_conf` cannot redirect subsequent alerts |
-| `t/variants/self-hosted/020_log_symlink_refusal.pl` | If the log path is a symlink (e.g. an attacker swapped the file), `O_NOFOLLOW` refuses to open it and the symlink target is not written |
-| `t/variants/self-hosted/021_multiline_queries.pl` | Multi-line queries — pretty-printed SQL, CTEs with tabs and newlines, newlines inside string literals, and multi-statement batches sent as a single `PQexec` — produce exactly one JSON line per trap event with the `query` field round-tripping verbatim through `\n`/`\t` escaping |
-| `t/variants/self-hosted/022_json_in_queries.pl` | SQL carrying JSON-shaped content (string literals containing JSON, JSONB casts, dollar-quoted JSON, JSON with backslash escapes, adversarial forge-shaped payloads) cannot escape its `query` string-value container; the outer alert object's `event`/`tag` stay legitimate and the query field round-trips byte-for-byte |
-| `t/variants/self-hosted/023_type_usage_acl.pl` | Non-superusers cannot cast to `honey_bun` (or an alias type) or create a column of that type, closing the indirect forge primitive where an attacker would otherwise plant their own honey row to fire the trap with chosen tag; `GRANT USAGE` re-enables planting for a named role |
-| `t/variants/self-hosted/024_field_injection.pl` | The alert object's non-`query` user-influenced fields (`tag` from planted honey values, `application_name` from session GUC) round-trip JSON-safely; embedded newlines, quotes, and forge-shaped bytes cannot hijack the outer object's `event` field |
-| `t/variants/self-hosted/025_log_permission_denied.pl` | When the log path's parent directory is unwriteable (e.g. EACCES on `open()`), the trap query still succeeds with rows returned and no extension-shaped error leaks to the client; alerts resume cleanly once writability is restored |
-| `t/variants/self-hosted/026_log_rotation.pl` | Renaming or deleting the live log file (the pattern logrotate's `create` mode uses) is handled cleanly: the next trap event recreates the file at the configured path and does not touch the rotated copy |
-| `t/variants/self-hosted/027_red_team.pl` | Adversarial playbook against every defense layer (direct-call REVOKE, USAGE revoke, type-system USAGE check, PGC_POSTMASTER lock on `enabled`, frozen log_path, inventory-view lockdown). Asserts each attack vector fails AND that the legitimate read-path trap still fires |
-| `t/variants/self-hosted/028_streaming_replica.pl` | Primary + streaming hot-standby in one TAP file: trap fires on the standby via typeoutput dispatch and writes to the standby's own log file, the primary's log is not touched, and the standby is verified to actually be in recovery |
-| `t/variants/self-hosted/029_logical_replication.pl` | Publisher + subscriber: the subscription's apply worker materializes honey rows via `honey_bun_recv` (passing the C-level USAGE check when the subscription owner has USAGE) and subsequent subscriber-side reads fire the trap on the subscriber's own log |
-| `t/variants/self-hosted/030_utf8_and_encoding.pl` | Multi-byte UTF-8 (Japanese, emoji, Cyrillic, Greek, Arabic, diacritics) in `tag` and in `query` round-trip verbatim through `escape_json`; all standard log fields are present on every line (field-stability regression guard) |
-| `t/variants/self-hosted/031_recon_paths.pl` | Documents the recon paths open to a non-superuser (`pg_type`, `pg_proc.prosrc`, `pg_attribute` joins reconstruct the inventory) and the one closed path (`honey_bun_columns` view). Pins both states so future hardening or accidental loosening shows up as test churn |
-| `t/variants/self-hosted/032_bgworker_resilience.pl` | Heartbeat bgworker is alive and emitting at the configured interval — heartbeat-emission is the only externally observable liveness signal because the SHMEM-only worker does not appear in `pg_stat_activity` |
-| `t/variants/self-hosted/033_heartbeat_no_db.pl` | Heartbeat bgworker holds no database connection: dropping the `postgres` database does not break it; heartbeats continue and carry only the minimal `ts`/`event`/`tag`/`pid` fields appropriate for a process beacon |
-| `t/variants/self-hosted/034_logical_replication_acls.pl` | Negative-path complement to `t/variants/self-hosted/029_*.pl`: subscription owner without `USAGE` on `honey_bun` stalls the apply worker (the C-level `pg_type_aclcheck` in `honey_bun_recv` fires from the replication path, not just direct casts); `GRANT USAGE` recovers the subscription |
-
-The RDS variant has a manual smoke test (`rds/smoke_test.sh`) since it
-requires a real RDS/Aurora cluster with `pg_tle` and `aws_lambda`.
-
-### Online RDS test (real AWS resources)
-
-`rds/online/` provisions a real RDS instance + Lambda + IAM + security
-group in your AWS account, runs the assertions that map across from the
-self-hosted suite, then tears everything down. Costs a few cents per
-run. See `rds/online/README.md` for the env-var contract and the
-multi-layer cleanup story (tag-based discovery, refuse-if-tag-mismatch
-delete, always-fire `END {}` block, `make rds-list-orphans` safety net).
+RDS suite (provisions a real RDS instance + read replica + Lambda
+in your AWS account, costs a few cents per run, tears everything down
+at the end):
 
 ```sh
-# Once your AWS creds + VPC/subnet are in the env:
-make rds-test-online
+make rds-test-online       # see rds/online/README.md for the env contract
 ```
+
+The harness's cleanup story is in `rds/online/README.md` (tag-based
+discovery, refuse-if-tag-mismatch delete, always-fire `END {}` block,
+`make rds-list-orphans` safety net).
+
+For ad-hoc validation against a real cluster you already have, the
+manual smoke test at `rds/smoke_test.sh` exercises the RDS variant's
+install + plant + read path against whatever PG endpoint your env
+vars point at.
 
 ### TDD discipline
 
-New functionality starts with a failing test under `t/`. Run with
-`make docker-test-15` for inner-loop feedback. Tests that don't care about
-heartbeats should set `sticky_honey_bun.heartbeat_interval_seconds = 0` in
-their cluster config to keep the log file deterministic.
+New functionality starts with a failing test under
+`t/variants/<variant>/`. Cross-variant assertion bodies go in
+`t/lib/SHB_Assertions.pm`. Run `make docker-test-15` for inner-loop
+feedback. Tests that don't care about heartbeats should set
+`sticky_honey_bun.heartbeat_interval_seconds = 0` in their cluster
+config to keep the log file deterministic.
 
 ### Extension upgrade discipline
 

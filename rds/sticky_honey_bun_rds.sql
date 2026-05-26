@@ -101,6 +101,7 @@ AS $$
 DECLARE
     tag        text := convert_from(stored, 'UTF8');
     arn        text;
+    enabled    text;
     cluster_id text;
     payload    jsonb;
 BEGIN
@@ -108,6 +109,20 @@ BEGIN
     -- but SECURITY DEFINER means we run as the extension owner, which has
     -- SELECT by default. An attacker session cannot silence the trap by
     -- modifying these values — they have no GRANTs.
+
+    -- Owner-controlled kill switch. Sticky Honey Bun is enabled by
+    -- default (no row → fire); the operator can disable by setting
+    -- key='enabled' value='off' (or 'false' / '0'). This mirrors the
+    -- self-hosted `sticky_honey_bun.enabled` GUC but lives in the
+    -- locked-down config table so a per-session attacker cannot flip
+    -- it the way they could a custom-namespace GUC.
+    SELECT value INTO enabled
+      FROM sticky_honey_bun_rds_config
+     WHERE key = 'enabled';
+    IF enabled IN ('off', 'false', '0', 'no') THEN
+        RETURN tag;
+    END IF;
+
     SELECT value INTO arn
       FROM sticky_honey_bun_rds_config
      WHERE key = 'lambda_arn';

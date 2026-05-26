@@ -25,6 +25,9 @@ our @EXPORT_OK = qw(
     connstr
     psql_run
     poll_alert
+    count_alerts
+    parse_alert_event
+    get_event_fn
     run_cmd
     schema_setup
     unique_tag
@@ -117,6 +120,75 @@ sub poll_alert {
         ['rds/online/.venv/bin/python3', 'rds/online/poll_alert.py',
          $log_group, $needle, "--timeout=$timeout"]);
     return ($rc == 0, $out, $err);
+}
+
+# count_alerts($state, $needle, %opts) -> integer
+# One-shot count of CloudWatch events containing $needle in the last
+# `since` seconds (default 300). Used for negative-case assertions:
+# "after this operation completes, exactly N events matching $needle
+# should exist." The caller is responsible for pacing — typically you
+# call poll_alert() first on a sentinel tag, and only call this once
+# the sentinel arrives (which proves any earlier invocations would
+# already be ingested too).
+#
+# Options:
+#   since => 300        # seconds back to search
+sub count_alerts {
+    my ($state, $needle, %opts) = @_;
+    my $since = $opts{since} // 300;
+    my $log_group = $state->{resources}{lambda_log_group};
+    my ($rc, $out, $err) = run_cmd(
+        ['rds/online/.venv/bin/python3', 'rds/online/poll_alert.py',
+         $log_group, $needle, '--count', "--since=$since"]);
+    die "count_alerts failed (rc=$rc): $err\n" if $rc != 0;
+    chomp $out;
+    return $out + 0;
+}
+
+# parse_alert_event($alert_text) -> $hashref_or_undef
+# Both variants emit one JSON object per alert. Self-hosted writes it
+# straight to the log file (text == the JSON). RDS Lambda wraps it in
+# CloudWatch's text envelope: `[WARNING]\t<ts>\t<reqid>\tshb_alert
+# {<JSON>}`. This helper finds the JSON-object substring in either
+# shape and decodes it, so cross-variant assertions can do field-level
+# checks (e.g. `$event->{tag} eq 'X'`) without each test reimplementing
+# the envelope strip.
+#
+# Returns undef on parse failure (caller is expected to assert non-undef
+# before dereferencing).
+sub parse_alert_event {
+    my ($text) = @_;
+    return undef unless defined $text && length $text;
+    # Locate the first `{` that starts a top-level JSON object and grab
+    # to the matching last `}`. The shb_alert prefix in the CloudWatch
+    # envelope makes this easy: everything after `shb_alert ` is the
+    # JSON. Self-hosted log lines ARE the JSON, so the substring search
+    # finds the leading `{` directly.
+    my $json;
+    if ($text =~ /shb_alert\s+(\{.*\})/s) {
+        $json = $1;
+    } elsif ($text =~ /^\s*(\{.*\})\s*$/s) {
+        $json = $1;
+    } else {
+        return undef;
+    }
+    my $event = eval { decode_json($json) };
+    return $@ ? undef : $event;
+}
+
+# get_event_fn($state) -> coderef
+# Builds the standard $get_event coderef every RDS test file needs:
+# poll CloudWatch for $needle, parse out the JSON event, return the
+# decoded hashref (or undef on miss / parse failure). This is the
+# bridge between poll_alert's raw-text return and SHB_Assertions's
+# parsed-event expectation.
+sub get_event_fn {
+    my ($state) = @_;
+    return sub {
+        my ($needle) = @_;
+        my ($ok, $payload) = poll_alert($state, $needle);
+        return $ok ? parse_alert_event($payload) : undef;
+    };
 }
 
 # schema_setup($state, $schema, %connstr_opts) -> $connstr_with_search_path

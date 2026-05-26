@@ -22,7 +22,7 @@ $node->safe_psql('postgres', q{
 });
 
 # pg_dump streams table data via COPY ... TO STDOUT, which invokes typoutput.
-# This confirms the alerter has something to suppress on by application_name.
+# This confirms the alert processor has something to suppress on by application_name.
 $node->command_ok(['pg_dump', '-d', 'postgres'], 'pg_dump succeeds');
 
 ok(-e $log_path && -s $log_path, 'pg_dump produced a log entry');

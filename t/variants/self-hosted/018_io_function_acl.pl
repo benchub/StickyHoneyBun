@@ -17,7 +17,7 @@ use Test::More;
 # fully-formed alert line with arbitrary `tag` and arbitrary query text.
 # That gives an attacker a primitive to (a) drown out a real trap event in
 # noise, (b) plant decoys aimed at innocent-looking targets, or (c) trigger
-# the alerter's auto-revoke against themselves on purpose.
+# the alert processor's auto-revoke against themselves on purpose.
 #
 # The fix is REVOKE EXECUTE FROM PUBLIC. The type system's typeoutput
 # dispatch does NOT consult function ACLs (it's invoked from the protocol

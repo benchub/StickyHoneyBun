@@ -1,9 +1,16 @@
+# Variants: self-hosted, rds
+# (The plant+SELECT+JSON-shape body lives in t/lib/SHB_Assertions.pm and
+# also runs against the RDS variant from t/variants/rds/014_long_query.pl.
+# The single-line / log-size invariants below are self-hosted-specific —
+# the RDS variant cannot count log lines because alerts go to CloudWatch.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
-use Test::More;
+use SHB_Assertions;
 use JSON::PP;
+use Test::More;
 
 # debug_query_string can be very long (multi-MB EXPLAIN, fat IN-lists,
 # embedded blobs). The JSON log line carries it whole, which can exceed
@@ -32,8 +39,34 @@ $node->safe_psql('postgres', q{
 my $padding = '/* ' . ('x' x 16000) . ' */';
 my $query   = "SELECT * FROM t WHERE id = 1 $padding";
 
-$node->safe_psql('postgres', $query);
+my $tag = 'public.t.honey';
 
+my $get_event = sub {
+    my ($needle) = @_;
+    return undef unless -e $log_path && -s $log_path;
+    open my $fh, '<', $log_path or die "cannot open $log_path: $!";
+    my @lines = <$fh>;
+    close $fh;
+    for my $line (@lines) {
+        next unless index($line, $needle) >= 0;
+        my $event = eval { decode_json($line) };
+        return $@ ? undef : $event;
+    }
+    return undef;
+};
+
+SHB_Assertions::assert_alert_fields(
+    sub { $node->psql('postgres', $_[0]) },
+    $get_event,
+    tag     => $tag,
+    trigger => $query,
+    like    => { query => qr/x{16000}/ },
+    label   => 'long query (16 KB padding) produces well-formed alert');
+
+# Self-hosted-specific: the long line must arrive as exactly one log row
+# (no internal split from a non-atomic write). This is the property the
+# flock() guard exists to protect — the RDS variant can't observe it
+# directly because CloudWatch normalizes line framing.
 ok(-e $log_path && -s $log_path, 'log file written for long query');
 
 open(my $fh, '<', $log_path) or die "cannot open $log_path: $!";
@@ -48,16 +81,6 @@ chomp $line;
 
 cmp_ok(length($line), '>', 16000,
        'line is genuinely longer than PIPE_BUF');
-
-my $event = eval { decode_json($line) };
-ok(!$@, 'long-query log line parses as valid JSON')
-    or diag("decode error: $@\nfirst 200 bytes: " . substr($line, 0, 200));
-
-is($event->{tag}, 'public.t.honey',
-   'tag field intact past the long-query boundary');
-
-like($event->{query}, qr/xxxxxxxxxxxxxxxxxxxx/,
-     'long query content preserved in the query field');
 
 $node->stop;
 done_testing();

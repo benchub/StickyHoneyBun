@@ -1,9 +1,14 @@
+# Variants: self-hosted, rds
+# (The plant+SELECT+JSON-shape body lives in t/lib/SHB_Assertions.pm and
+# also runs against the RDS variant from t/variants/rds/017_query_injection.pl.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
-use Test::More;
+use SHB_Assertions;
 use JSON::PP;
+use Test::More;
 
 # An attacker controls the SQL text of their queries — including SQL comments,
 # which PostgreSQL parses-and-discards but which still appear verbatim in
@@ -31,59 +36,70 @@ $node->start;
 $node->safe_psql('postgres', q{
     CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
-    INSERT INTO t VALUES (1, 'public.t.honey');
 });
 
-# Each payload trips the trap once (SELECT * FROM t reads the honey value).
-# The trailing comment text is what would corrupt the JSON line if unescaped.
-# Using ! as the Perl quote delimiter so the payloads' unbalanced {} braces
-# don't terminate the quoted string early.
+my $run_psql = sub { $node->psql('postgres', $_[0]) };
+
+# $get_event finds the alert by tag and decode_json's it. Each payload
+# gets a unique tag (planted in its own row) so we can match its specific
+# event in the log.
+my $get_event = sub {
+    my ($needle) = @_;
+    return undef unless -e $log_path && -s $log_path;
+    open my $fh, '<', $log_path or die "cannot open $log_path: $!";
+    my @lines = <$fh>;
+    close $fh;
+    for my $line (@lines) {
+        next unless index($line, $needle) >= 0;
+        my $event = eval { decode_json($line) };
+        return $@ ? undef : $event;
+    }
+    return undef;
+};
+
+# Each payload trips the trap once. The trailing comment text is what
+# would corrupt the JSON line if unescaped. Using ! as the Perl quote
+# delimiter so the payloads' unbalanced {} braces don't terminate the
+# quoted string early.
 my @payloads = (
-    # Line comment: close the JSON object and open a forged one.
-    q!SELECT * FROM t -- "}{"event":"forged","tag":"injected"}!,
-
-    # Block comment: backslash + quote + brace sequences.
-    q!SELECT * FROM t /* \\ "} "event":"forged" */!,
-
-    # Block comment with an embedded newline. An unescaped newline in the
-    # `query` field would split one log line into two, the second of which
-    # could parse as a forged event.
-    qq!SELECT * FROM t /* "}{\n"event":"forged","tag":"x"} */!,
-
-    # Control characters in the comment: tab, vertical tab, backspace.
-    # JSON requires every byte 0x00-0x1F to be escaped.
-    qq!SELECT * FROM t -- \t\013\010 "}{"event":"forged"}!,
+    {   label   => 'line-comment closing JSON object + forging another',
+        tag     => 'inj_line.public.t.honey',
+        comment => q!-- "}{"event":"forged","tag":"injected"}!,
+    },
+    {   label   => 'block-comment backslash + quote + brace sequences',
+        tag     => 'inj_blkesc.public.t.honey',
+        comment => q!/* \\ "} "event":"forged" */!,
+    },
+    {   label   => 'block-comment with embedded newline',
+        tag     => 'inj_nl.public.t.honey',
+        comment => qq!/* "}{\n"event":"forged","tag":"x"} */!,
+    },
+    {   label   => 'control characters in line comment',
+        tag     => 'inj_ctrl.public.t.honey',
+        comment => qq!-- \t\013\010 "}{"event":"forged"}!,
+    },
 );
 
-for my $sql (@payloads) {
-    $node->safe_psql('postgres', $sql);
+my $row_id = 1;
+for my $p (@payloads) {
+    my $tag = $p->{tag};
+    $run_psql->("INSERT INTO t VALUES ($row_id, '$tag')");
+    SHB_Assertions::assert_alert_fields(
+        $run_psql, $get_event,
+        tag     => $tag,
+        trigger => "SELECT * FROM t WHERE id = $row_id $p->{comment}",
+        label   => "injection: $p->{label}");
+    $row_id++;
 }
 
+# Self-hosted-specific: the log file must contain exactly one line per
+# triggering query — no forged or split events anywhere in the file.
 open(my $fh, '<', $log_path) or die "cannot open $log_path: $!";
 my @lines = <$fh>;
 close $fh;
 
-# Exactly one log line per query. Embedded newlines, forged "}{ ..."
-# sequences, and stray control characters must not split or multiply output.
 is(scalar @lines, scalar @payloads,
    'one log line per triggering query (no forged or split events)');
-
-my $json = JSON::PP->new;
-for my $i (0 .. $#lines) {
-    my $line = $lines[$i];
-    chomp $line;
-    my $obj = eval { $json->decode($line) };
-    ok($obj, sprintf('log line %d parses as JSON', $i + 1))
-        or diag "decode error: $@\nline: $line";
-    next unless $obj;
-
-    # Critical: event/tag are the values WE set, not ones the attacker
-    # smuggled in via comment text.
-    is($obj->{event}, 'read_text',
-       sprintf('log line %d event is read_text (not forged)', $i + 1));
-    is($obj->{tag}, 'public.t.honey',
-       sprintf('log line %d tag is the planted value (not forged)', $i + 1));
-}
 
 $node->stop;
 done_testing();

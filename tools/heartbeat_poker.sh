@@ -4,7 +4,7 @@
 #
 # Periodically issues a SELECT against a designated heartbeat row on one or
 # more PostgreSQL endpoints. The read trips honey_bun's output function,
-# which emits a heartbeat-tagged log entry. The alerter treats absence of
+# which emits a heartbeat-tagged log entry. The alert processor treats absence of
 # these as a deadman trigger.
 #
 # Intended for RDS replicas (where bgworkers don't run) and read replicas in

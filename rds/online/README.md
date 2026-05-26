@@ -16,7 +16,7 @@ first run.
 | File | Purpose |
 |---|---|
 | `preflight.py` | env-var validation, AWS session-time check, external-IP detection, stale-resource halt |
-| `setup.py` | provisions every AWS resource, tagged with the run-id; writes `state-<run_id>.json` |
+| `setup.py` | provisions every AWS resource (RDS primary + read replica, Lambda, IAM, SG, parameter groups), tagged with the run-id; writes `state-<run_id>.json` |
 | `teardown.py` | tag-discovery-based cleanup; refuses to delete anything whose tag doesn't match |
 | `list_orphans.py` | safety-net inspector — lists resources from any past test run still in AWS |
 | `poll_alert.py` | polls Lambda's CloudWatch log group for a needle string |

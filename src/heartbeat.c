@@ -83,7 +83,7 @@ shb_register_bgworker(void)
         "Seconds between heartbeat log lines emitted by the background worker.",
         "Set to 0 to disable heartbeats. PGC_POSTMASTER: can only be set "
         "in postgresql.conf at server start; a compromised superuser "
-        "session cannot silence the heartbeat (and trigger the alerter's "
+        "session cannot silence the heartbeat (and trigger the alert processor's "
         "deadman) via ALTER SYSTEM.",
         &shb_heartbeat_interval_seconds,
         SHB_BGWORKER_DEFAULT_INTERVAL,

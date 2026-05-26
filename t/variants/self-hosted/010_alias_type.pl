@@ -1,7 +1,14 @@
+# Variants: self-hosted, rds
+# (The "alias type registered in pg_type" body lives in
+# t/lib/SHB_Assertions.pm and also runs against the RDS variant from
+# t/variants/rds/010_alias_type.pl. The C-symbol-sharing and
+# log-file-shape checks below are self-hosted-specific.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
+use SHB_Assertions;
 use Test::More;
 
 # Site-specific deployments may want to plant honey columns under a less
@@ -30,9 +37,10 @@ $node->safe_psql('postgres', q{
         (2, 'public.accounts.honey');
 });
 
-my $type_exists = $node->safe_psql('postgres',
-    "SELECT 1 FROM pg_type WHERE typname = 'account_token'");
-is($type_exists, '1', 'aliased type is registered');
+my $run_psql = sub { $node->psql('postgres', $_[0]) };
+
+SHB_Assertions::assert_alias_type_registered(
+    $run_psql, 'account_token', 'account_token alias');
 
 # Confirm the alias is backed by the same C output implementation
 # (different SQL-level OIDs, same compiled symbol).

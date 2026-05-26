@@ -1,3 +1,9 @@
+# Variants: self-hosted, rds
+# (RDS twin is t/variants/rds/015_concurrent_writes.pl. The
+# RDS variant tests that Lambda + CloudWatch queue cleanly under
+# concurrent reads; this self-hosted variant tests that flock()
+# prevents log-line interleaving when many backends write at once.)
+
 use strict;
 use warnings;
 use lib 't/lib';

@@ -1,7 +1,13 @@
+# Variants: self-hosted, rds
+# (The inventory-listing and DROP-COLUMN-removal bodies live in
+# t/lib/SHB_Assertions.pm and also run against the RDS variant from
+# t/variants/rds/008_inventory.pl.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
+use SHB_Assertions;
 use Test::More;
 
 my $log_path = SHB::tempdir() . '/shb.log';
@@ -23,28 +29,20 @@ $node->safe_psql('postgres', q{
     CREATE TABLE public.no_honey  (id int, name text);
 });
 
-my $rows = $node->safe_psql('postgres', q{
-    SELECT schema_name || '.' || table_name || '.' || column_name
-      FROM honey_bun_columns
-});
+my $run_psql = sub { $node->psql('postgres', $_[0]) };
 
-my @actual = sort split /\n/, $rows;
-my @expected = sort (
-    'private.sessions.honey',
-    'public.audit.honey',
-    'public.customers.honey',
-);
-
-is_deeply(\@actual, \@expected,
-    'inventory lists exactly the columns declared as honey_bun');
+SHB_Assertions::assert_inventory_lists_columns(
+    $run_psql,
+    [   'private.sessions.honey',
+        'public.audit.honey',
+        'public.customers.honey',
+    ],
+    label => 'inventory lists exactly the columns declared as honey_bun');
 
 # Dropping a honey column removes it from the inventory.
-$node->safe_psql('postgres', 'ALTER TABLE public.audit DROP COLUMN honey');
-
-my $after_drop = $node->safe_psql('postgres', q{
-    SELECT count(*) FROM honey_bun_columns WHERE table_name = 'audit'
-});
-is($after_drop, '0', 'dropped honey column removed from inventory');
+SHB_Assertions::assert_dropped_column_removed_from_inventory(
+    $run_psql, 'public', 'audit', 'honey',
+    'dropped honey column removed from inventory');
 
 $node->stop;
 done_testing();

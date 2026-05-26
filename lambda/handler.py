@@ -3,7 +3,7 @@ Sticky Honey Bun receiver Lambda (reference).
 
 This Lambda receives a JSON event from the RDS PL/pgSQL variant's honey_bun
 output function (invoked via aws_lambda.invoke). Its job is to normalize the
-payload, drop it into the alerter's sink, and optionally fan out to SNS / SQS
+payload, drop it into the alert processor's sink, and optionally fan out to SNS / SQS
 / etc.
 
 Payload contract
@@ -11,7 +11,7 @@ Payload contract
 
 The RDS PL function sends a JSON object with these fields. Field order and
 naming match the self-hosted C variant's log line, so a single downstream
-alerter handles both sources.
+alert processor handles both sources.
 
   ts               ISO-8601 UTC timestamp with microseconds, e.g.
                    "2026-05-25T04:11:36.205673Z".

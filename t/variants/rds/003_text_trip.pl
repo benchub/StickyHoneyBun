@@ -18,18 +18,19 @@ my $cs  = SHB_RDS::schema_setup($st, 'shb_t003');
 my $tag = SHB_RDS::unique_tag($st, 'text_trip');
 
 # poll_alert returns ($ok, $payload, $stderr). The shared assertion
-# expects a function that returns the alert text or '' on miss, so
-# project to the payload (which on success contains the full Lambda
-# log line with the JSON object the C variant writes to disk).
-my $get_alert = sub {
+# expects a function that returns the decoded JSON event (or undef on
+# miss), so wrap poll_alert with parse_alert_event which strips the
+# CloudWatch envelope (`[WARNING]\t<ts>\t<reqid>\tshb_alert {JSON}`)
+# and decodes.
+my $get_event = sub {
     my ($needle) = @_;
     my ($ok, $payload) = SHB_RDS::poll_alert($st, $needle);
-    return $ok ? $payload : '';
+    return $ok ? SHB_RDS::parse_alert_event($payload) : undef;
 };
 
 SHB_Assertions::assert_text_trip(
     sub { SHB_RDS::psql_run($cs, $_[0]) },
-    $get_alert,
+    $get_event,
     $tag,
     label => 'RDS honey row text-trip');
 

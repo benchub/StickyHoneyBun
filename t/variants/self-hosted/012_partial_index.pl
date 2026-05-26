@@ -1,7 +1,13 @@
+# Variants: self-hosted, rds
+# (The "partial index build does not fire the trap" body for the
+# canonical honey_bun type lives in t/lib/SHB_Assertions.pm. The
+# alias-type and indexed-read coverage below is self-hosted-specific.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
+use SHB_Assertions;
 use Test::More;
 
 # A partial index on the honey column (e.g. WHERE honey IS NOT NULL) is the
@@ -26,10 +32,11 @@ $node->safe_psql('postgres', q{
     CREATE EXTENSION sticky_honey_bun;
 
     -- Canonical honey_bun column with one trap and many NULL legitimate rows.
-    CREATE TABLE customers (id int PRIMARY KEY, honey honey_bun);
-    INSERT INTO customers
+    -- Named `t` to match the shared assertion's hard-coded table.
+    CREATE TABLE t (id int PRIMARY KEY, honey honey_bun);
+    INSERT INTO t
         SELECT g, NULL FROM generate_series(1, 1000) g;
-    INSERT INTO customers VALUES (1001, 'public.customers.honey');
+    INSERT INTO t VALUES (1001, 'public.t.honey');
 
     -- Same shape under an aliased type.
     SELECT create_honey_bun_alias('account_token');
@@ -52,35 +59,51 @@ sub clear_log {
     close $fh;
 }
 
-# ---- honey_bun ----
+my $run_psql = sub { $node->psql('postgres', $_[0]) };
+
+# $count_alerts counts log lines matching $needle. The shared assertion
+# uses it to do a before/after delta around the index build.
+my $count_alerts = sub {
+    my ($needle) = @_;
+    return 0 unless -e $log_path;
+    open(my $fh, '<', $log_path) or return 0;
+    my $n = 0;
+    while (my $line = <$fh>) {
+        $n++ if index($line, $needle) >= 0;
+    }
+    close $fh;
+    return $n;
+};
+
+# ---- canonical honey_bun, via the shared assertion ----
 
 clear_log();
-$node->safe_psql('postgres',
-    'CREATE INDEX customers_honey_idx ON customers (honey) WHERE honey IS NOT NULL');
-is(count_lines(), 0,
-   'building a partial index on honey_bun does not fire the trap');
+SHB_Assertions::assert_partial_index_build_silent(
+    $run_psql, $count_alerts,
+    'public.t.honey',
+    'partial index build on honey_bun does not fire the trap');
 
 my $hb_idx = $node->safe_psql('postgres', q{
     SELECT 1 FROM pg_indexes
      WHERE schemaname = 'public'
-       AND indexname = 'customers_honey_idx'
+       AND indexname = 'shb_part_idx'
 });
 is($hb_idx, '1', 'partial index on honey_bun is registered');
 
 # Query that reads the trap value through the indexed path.
 clear_log();
-$node->safe_psql('postgres', 'ANALYZE customers');
 my $plan = $node->safe_psql('postgres',
-    'EXPLAIN SELECT honey FROM customers WHERE honey IS NOT NULL');
+    'EXPLAIN SELECT honey FROM t WHERE honey IS NOT NULL');
 like($plan, qr/Index/i,
      'planner chooses the partial index for the trap-row lookup');
 
 clear_log();
 $node->safe_psql('postgres',
-    'SELECT honey FROM customers WHERE honey IS NOT NULL');
+    'SELECT honey FROM t WHERE honey IS NOT NULL');
 is(count_lines(), 1, 'reading the indexed honey value fires the trap once');
 
-# ---- alias type ----
+# ---- alias type (self-hosted-specific; the shared assertion is hard-
+# coded to the canonical `honey_bun` column on table `t`) ----
 
 clear_log();
 $node->safe_psql('postgres',

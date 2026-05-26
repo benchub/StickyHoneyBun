@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
+use JSON::PP;
 use Test::More;
 
 # Streaming-replication / hot-standby coverage. The README's End goals
@@ -17,6 +18,11 @@ use Test::More;
 #   3. The primary's log is NOT modified by standby-side reads.
 #   4. The standby is actually a read-only replica (sanity check that we
 #      didn't accidentally connect to the primary).
+#   5. The `server_addr` field in each cluster's alert identifies which
+#      node fired — primary's reads carry the primary's local address,
+#      standby's reads carry the standby's. Mirrors the RDS variant's
+#      805 test (cross-variant assertion this is, though here we verify
+#      from the dedicated log files, not from a shared alert sink).
 
 my $primary_log = SHB::tempdir() . '/primary.log';
 my $standby_log = SHB::tempdir() . '/standby.log';
@@ -75,6 +81,29 @@ like($lines[0], qr/"event":"read_text"/,
      'standby log entry is read_text');
 like($lines[0], qr/"tag":"public\.t\.honey"/,
      'standby log entry has the planted tag');
+
+# server_addr identifies which node fired. Cross-check by also reading
+# the primary's log (which has the trap that fired on the publisher
+# during the INSERT — wait, no: INSERT goes through honey_bun_in, not
+# honey_bun_out. So the primary's log is still empty here unless
+# we explicitly read from the primary). Let's read on the primary too
+# and compare.
+$primary->safe_psql('postgres', 'SELECT * FROM t');
+open($fh, '<', $primary_log) or die "cannot open $primary_log: $!";
+my @primary_lines = <$fh>;
+close $fh;
+is(scalar @primary_lines, 1, 'exactly one log entry on the primary after its own read');
+
+my $standby_event = decode_json($lines[0]);
+my $primary_event = decode_json($primary_lines[0]);
+
+ok(defined $standby_event->{server_addr} && length $standby_event->{server_addr},
+   'standby alert carries a server_addr field');
+ok(defined $primary_event->{server_addr} && length $primary_event->{server_addr},
+   'primary alert carries a server_addr field');
+isnt($standby_event->{server_addr}, $primary_event->{server_addr},
+   "server_addr differs between primary ($primary_event->{server_addr}) "
+ . "and standby ($standby_event->{server_addr})");
 
 # Sanity: writes on the standby are refused (proves we're truly on a
 # hot standby, not accidentally talking to the primary).

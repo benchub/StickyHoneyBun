@@ -6,7 +6,7 @@ use Test::More;
 
 # sticky_honey_bun.heartbeat_interval_seconds is PGC_POSTMASTER: it can only
 # be set in postgresql.conf at server start, so a compromised superuser
-# cannot silence the heartbeat (and thereby trigger the alerter's deadman)
+# cannot silence the heartbeat (and thereby trigger the alert processor's deadman)
 # via ALTER SYSTEM. We test the on path here; the off path is by configuration.
 
 my $log_path = SHB::tempdir() . '/shb.log';

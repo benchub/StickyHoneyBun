@@ -7,6 +7,7 @@
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/time.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -126,6 +127,44 @@ get_client_addr(char *out, size_t outlen)
         snprintf(out, outlen, "unknown");
 }
 
+/*
+ * The address THIS server is bound to (the local side of the client
+ * connection). Different per physical node, so primary vs replica
+ * vs standby are distinguishable from the alert payload even when
+ * they share a cluster_id. Mirrors the RDS variant's `server_addr`
+ * field so a single alert processor sees the same field name regardless of
+ * which variant emitted the event.
+ *
+ * For Unix-socket connections we include the listening socket path
+ * (typically `/tmp/.s.PGSQL.<port>` or `<DataDir>/.s.PGSQL.<port>`)
+ * because the path is the only thing that differs between two PG
+ * instances running on the same host — without it, every node on the
+ * same machine would report `local` and node identification would be
+ * impossible for multi-cluster setups (test harness, replicas, etc.).
+ */
+static void
+get_server_addr(char *out, size_t outlen)
+{
+    if (!MyProcPort)
+    {
+        snprintf(out, outlen, "internal");
+        return;
+    }
+    if (MyProcPort->laddr.addr.ss_family == AF_UNIX)
+    {
+        struct sockaddr_un *un = (struct sockaddr_un *) &MyProcPort->laddr.addr;
+        if (un->sun_path[0])
+            snprintf(out, outlen, "local:%s", un->sun_path);
+        else
+            snprintf(out, outlen, "local");
+        return;
+    }
+    if (getnameinfo((struct sockaddr *) &MyProcPort->laddr.addr,
+                    MyProcPort->laddr.salen,
+                    out, outlen, NULL, 0, NI_NUMERICHOST) != 0)
+        snprintf(out, outlen, "unknown");
+}
+
 static void
 append_kv_str(StringInfo buf, const char *key, const char *value, bool first)
 {
@@ -215,6 +254,7 @@ do_log_event(const char *event, const char *tag)
     struct tm       tm_utc;
     char            ts[32];
     char            client[NI_MAXHOST];
+    char            server[NI_MAXHOST];
     StringInfoData  line;
 
     /*
@@ -229,6 +269,7 @@ do_log_event(const char *event, const char *tag)
     gmtime_r(&tv.tv_sec, &tm_utc);
     strftime(ts, sizeof(ts), "%Y-%m-%dT%H:%M:%S", &tm_utc);
     get_client_addr(client, sizeof(client));
+    get_server_addr(server, sizeof(server));
 
     initStringInfo(&line);
     appendStringInfoChar(&line, '{');
@@ -244,6 +285,7 @@ do_log_event(const char *event, const char *tag)
     append_kv_str(&line, "database", get_database_name(MyDatabaseId), false);
     append_kv_int(&line, "pid", MyProcPid, false);
     append_kv_str(&line, "client_addr", client, false);
+    append_kv_str(&line, "server_addr", server, false);
     append_kv_str(&line, "query", debug_query_string, false);
     appendStringInfoChar(&line, '}');
     appendStringInfoChar(&line, '\n');

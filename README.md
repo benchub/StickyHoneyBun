@@ -121,6 +121,7 @@ One JSON object per line (file) or per event (Lambda):
 | `client_addr` | `MyProcPort->raddr` | Primary alert processor filter key (paired with `session_user`) |
 | `query` | `debug_query_string` | Forensics; can be NULL in some internal call paths |
 | `cluster_id` | RDS variant only, set via the `sticky_honey_bun_rds_config` table (key `cluster_id`) | Identifies the source cluster when one Lambda fans many in |
+| `server_addr` | the local address PG was connected to (`MyProcPort->laddr` on self-hosted, `inet_server_addr()` on RDS) | Identifies which node within a cluster fired — primary vs each replica/standby. Always populated, independent of operator-set `cluster_id`. For unix-socket connections (typical in local/test deployments) carries `local:<socket-path>` so two PG instances on the same host stay distinguishable; for TCP connections, the listening IP |
 
 Heartbeat lines carry only `ts`, `event` (always `"heartbeat"`), `tag`
 (always `"heartbeat"`), and `pid`. The bgworker has no database

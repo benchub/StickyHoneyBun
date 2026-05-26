@@ -273,6 +273,128 @@ def create_db_parameter_group(rds, run_id, extra_tags):
     return name
 
 
+def create_rds_read_replica(rds, run_id, primary_instance, instance_class,
+                            sg_id, extra_tags):
+    """Provision a read replica of the primary. Used by t/variants/rds/
+    805_server_addr.pl to verify that alerts identify which node within
+    a cluster fired the trap (primary vs replica)."""
+    name = f"shbtest-{short_id(run_id)}-replica"
+    rds.create_db_instance_read_replica(
+        DBInstanceIdentifier=name,
+        SourceDBInstanceIdentifier=primary_instance,
+        DBInstanceClass=instance_class,
+        VpcSecurityGroupIds=[sg_id],
+        PubliclyAccessible=True,
+        AutoMinorVersionUpgrade=False,
+        DeletionProtection=False,
+        CopyTagsToSnapshot=False,
+        Tags=tag_list(run_id, extra_tags),
+    )
+    print(f"  waiting for RDS read replica {name} to become available "
+          "(another 8-12 minutes) ...")
+    waiter = rds.get_waiter("db_instance_available")
+    waiter.wait(
+        DBInstanceIdentifier=name,
+        WaiterConfig={"Delay": 30, "MaxAttempts": 60},
+    )
+    resp = rds.describe_db_instances(DBInstanceIdentifier=name)
+    endpoint = resp["DBInstances"][0]["Endpoint"]
+    return name, endpoint["Address"], endpoint["Port"]
+
+
+def ensure_primary_supports_replicas(rds, primary_instance):
+    """RDS rejects CreateDBInstanceReadReplica when the source has
+    BackupRetentionPeriod=0. Older harness runs created the primary
+    with retention=0; bump it to 1 (the minimum non-zero value) so a
+    replica can be provisioned. ApplyImmediately so we don't have to
+    wait for the maintenance window.
+
+    The naive `wait_for db_instance_available` is not sufficient here
+    because the instance may report `available` before the backup
+    settings actually propagate (no state transition for retention
+    changes). Poll BackupRetentionPeriod directly until it reflects the
+    new value AND the first automated backup has started — that's the
+    moment CreateDBInstanceReadReplica will accept the source."""
+    resp = rds.describe_db_instances(DBInstanceIdentifier=primary_instance)
+    inst = resp["DBInstances"][0]
+    if inst.get("BackupRetentionPeriod", 0) > 0:
+        return
+    print(f"setup: enabling automated backups on {primary_instance} "
+          "(required for read-replica creation)")
+    rds.modify_db_instance(
+        DBInstanceIdentifier=primary_instance,
+        BackupRetentionPeriod=1,
+        ApplyImmediately=True,
+    )
+    # Poll: wait for retention to actually reach 1 AND for the
+    # instance to be back in `available` (RDS briefly transitions
+    # through `backing-up` while the first snapshot kicks off).
+    deadline = time.time() + 600  # 10 minutes max
+    while time.time() < deadline:
+        resp = rds.describe_db_instances(DBInstanceIdentifier=primary_instance)
+        inst = resp["DBInstances"][0]
+        if (inst.get("BackupRetentionPeriod", 0) >= 1
+                and inst.get("DBInstanceStatus") == "available"):
+            return
+        time.sleep(15)
+    fail(f"timed out waiting for backups to enable on {primary_instance}")
+
+
+def ensure_read_replica(rds, run_id, primary_instance, instance_class,
+                        sg_id, extra_tags, state):
+    """Idempotent replica provisioning. If the replica already exists,
+    just refresh the state file with its endpoint. Otherwise provision
+    it. Called from both the fresh-setup path and do_install_only so
+    that reuse runs against an old instance (provisioned before this
+    feature) trigger a one-time replica creation.
+
+    Also attaches the Lambda-invoke IAM role to the replica. The role
+    does NOT propagate from the source instance — RDS instance roles
+    are per-instance — so without this step, aws_lambda.invoke from a
+    replica's PG backend silently fails (the honey_bun_out_rds
+    EXCEPTION block swallows the error) and the trap on replica reads
+    never reaches CloudWatch."""
+    name = f"shbtest-{short_id(run_id)}-replica"
+    try:
+        resp = rds.describe_db_instances(DBInstanceIdentifier=name)
+        endpoint = resp["DBInstances"][0]["Endpoint"]
+        print(f"setup: read replica {name} already exists, reusing")
+        host, port = endpoint["Address"], endpoint["Port"]
+    except rds.exceptions.DBInstanceNotFoundFault:
+        ensure_primary_supports_replicas(rds, primary_instance)
+        print(f"setup: creating read replica of {primary_instance}")
+        name, host, port = create_rds_read_replica(
+            rds, run_id, primary_instance, instance_class,
+            sg_id, extra_tags)
+    state["resources"]["rds_replica_instance"] = name
+    state["replica_endpoint"] = {"host": host, "port": port}
+    save_state(state)
+
+    # Attach the Lambda-invoke IAM role. RDS+PostgreSQL only supports
+    # ONE ARN per (instance, feature) pair, and re-attaching the same
+    # ARN errors with InvalidParameterValue (not the more specific
+    # DBInstanceRoleAlreadyExists). Check the current associations
+    # before issuing the API call instead of catching after the fact.
+    rds_role_arn = state["resources"].get("rds_invoke_role_arn")
+    if rds_role_arn:
+        resp = rds.describe_db_instances(DBInstanceIdentifier=name)
+        existing = resp["DBInstances"][0].get("AssociatedRoles", [])
+        already = any(
+            r["RoleArn"] == rds_role_arn and r["FeatureName"] == "Lambda"
+            for r in existing
+        )
+        if already:
+            print(f"setup: Lambda-invoke role already attached to replica {name}")
+        else:
+            rds.add_role_to_db_instance(
+                DBInstanceIdentifier=name,
+                RoleArn=rds_role_arn,
+                FeatureName="Lambda",
+            )
+            print(f"setup: attached Lambda-invoke role to replica {name}")
+            time.sleep(10)   # Role attachment takes a few seconds to settle
+
+
 def create_rds_instance(rds, run_id, instance_class, sg_id, subgrp,
                        paramgrp, master_user, master_pw, extra_tags):
     name = f"shbtest-{short_id(run_id)}"
@@ -289,7 +411,11 @@ def create_rds_instance(rds, run_id, instance_class, sg_id, subgrp,
         DBSubnetGroupName=subgrp,
         DBParameterGroupName=paramgrp,
         PubliclyAccessible=True,
-        BackupRetentionPeriod=0,
+        # Read replicas require automated backups enabled on the source.
+        # 1 day is the minimum non-zero retention; we don't actually
+        # rely on the backups for test purposes, but RDS rejects
+        # CreateDBInstanceReadReplica without this.
+        BackupRetentionPeriod=1,
         MultiAZ=False,
         AutoMinorVersionUpgrade=False,
         DeletionProtection=False,
@@ -485,6 +611,18 @@ def do_install_only(run_id):
     state["app_password"]      = app_pw
     save_state(state)
 
+    # Read replica — if this is an existing instance from before
+    # ensure_read_replica was introduced, provision it now (one-time
+    # ~12-minute step). Subsequent reuse runs find it already there.
+    region = state["region"]
+    rds = boto3.client("rds", region_name=region)
+    primary = state["resources"]["rds_instance"]
+    instance_class = state["config"]["instance_class"]
+    sg_id = state["resources"]["security_group"]
+    extra_tags = state["config"].get("extra_tags", {})
+    ensure_read_replica(rds, run_id, primary, instance_class, sg_id,
+                        extra_tags, state)
+
     print(f"setup: reinstall complete for run_id={run_id}")
 
 
@@ -637,6 +775,11 @@ def main():
     state["app_user"] = "shbtest_app"
     state["app_password"] = app_pw
     save_state(state)
+
+    # Read replica — provisioned after the primary's extension setup is
+    # done so 805_server_addr.pl can verify cross-node alert routing.
+    ensure_read_replica(rds, run_id, instance_id, instance_class, sg_id,
+                        extra_tags, state)
 
     print(f"\nsetup: complete. State file: {state_path(run_id)}")
     print(f"  endpoint: {host}:{port}")

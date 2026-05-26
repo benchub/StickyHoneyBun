@@ -1,9 +1,17 @@
+# Variants: self-hosted, rds
+# (The plant+SELECT+JSON-shape body lives in t/lib/SHB_Assertions.pm and
+# also runs against the RDS variant from t/variants/rds/021_multiline_queries.pl.
+# The byte-exact round-trip and the multi-statement batch checks below
+# are self-hosted-specific — only direct log-file access lets us verify
+# them.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
-use Test::More;
+use SHB_Assertions;
 use JSON::PP;
+use Test::More;
 
 # The alert log's "one JSON object per line" invariant has to hold even when
 # the SQL text contains literal newlines, which it routinely does in the
@@ -47,44 +55,88 @@ $node->start;
 $node->safe_psql('postgres', q{
     CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
-    INSERT INTO t VALUES (1, 'public.t.honey');
 });
+
+my $run_psql = sub { $node->psql('postgres', $_[0]) };
+
+my $get_event = sub {
+    my ($needle) = @_;
+    return undef unless -e $log_path && -s $log_path;
+    open my $fh, '<', $log_path or die "cannot open $log_path: $!";
+    my @lines = <$fh>;
+    close $fh;
+    for my $line (@lines) {
+        next unless index($line, $needle) >= 0;
+        my $event = eval { decode_json($line) };
+        return $@ ? undef : $event;
+    }
+    return undef;
+};
 
 # Pretty-printed multi-line query, no comments / string literals — just
 # natural whitespace formatting that an ORM or human would write.
-my $pretty = "SELECT *\nFROM t\nWHERE honey IS NOT NULL";
+my $pretty_tag = 'mline_pretty.public.t.honey';
+my $pretty     = "SELECT *\nFROM t\nWHERE id = 1";
 
 # CTE-style query with newlines and tabs. Tabs go through escape_json as
 # \t and must round-trip the same way.
-my $cte = "WITH q AS (\n\tSELECT *\n\tFROM t\n)\nSELECT * FROM q";
+my $cte_tag = 'mline_cte.public.t.honey';
+my $cte     = "WITH q AS (\n\tSELECT * FROM t WHERE id = 2\n)\nSELECT * FROM q";
 
 # Newlines inside a SQL string literal — accepted by PG, and the bytes are
 # part of debug_query_string.
+my $str_tag = 'mline_strlit.public.t.honey';
 my $str_literal = "SELECT *, '
 embedded
 newlines
-' AS lit FROM t";
+' AS lit FROM t WHERE id = 3";
+
+$run_psql->("INSERT INTO t VALUES (1, '$pretty_tag')");
+$run_psql->("INSERT INTO t VALUES (2, '$cte_tag')");
+$run_psql->("INSERT INTO t VALUES (3, '$str_tag')");
+
+SHB_Assertions::assert_alert_fields(
+    $run_psql, $get_event,
+    tag     => $pretty_tag,
+    trigger => $pretty,
+    like    => { query => qr/\n/ },
+    label   => 'multiline: pretty-printed multi-line SELECT');
+
+SHB_Assertions::assert_alert_fields(
+    $run_psql, $get_event,
+    tag     => $cte_tag,
+    trigger => $cte,
+    like    => { query => qr/\n/ },
+    label   => 'multiline: CTE with tabs and newlines');
+
+SHB_Assertions::assert_alert_fields(
+    $run_psql, $get_event,
+    tag     => $str_tag,
+    trigger => $str_literal,
+    like    => { query => qr/\n/ },
+    label   => 'multiline: string literal containing newlines');
+
+# Self-hosted-specific: byte-exact round-trip + multi-statement batch case.
+# We need direct log-file access for both — the round-trip strictness goes
+# beyond the shared `like => { query => /\n/ }` regex, and CloudWatch
+# can't observe the single-PQexec-with-embedded-semicolon framing.
 
 # Multi-statement batch as a single PQexec. The `\\;` (literal backslash-
 # semicolon) tells psql to buffer rather than split; the closing `;` then
-# flushes both statements together. Wire bytes: "SELECT * FROM t;\nSELECT
-# * FROM t;" sent in one query message. Both traps see the same
-# debug_query_string.
-my $batched_wire = "SELECT * FROM t;\nSELECT * FROM t;";
-my $batched_input = "SELECT * FROM t\\;\nSELECT * FROM t;";
-
-$node->safe_psql('postgres', $pretty);
-$node->safe_psql('postgres', $cte);
-$node->safe_psql('postgres', $str_literal);
+# flushes both statements together. Wire bytes: "SELECT * FROM t WHERE id
+# = 1;\nSELECT * FROM t WHERE id = 2;" sent in one query message. Both
+# traps see the same debug_query_string.
+my $batched_wire =
+    "SELECT * FROM t WHERE id = 1;\nSELECT * FROM t WHERE id = 2;";
+my $batched_input =
+    "SELECT * FROM t WHERE id = 1\\;\nSELECT * FROM t WHERE id = 2;";
 $node->safe_psql('postgres', $batched_input);
 
-# 1 row in t, one trap event per SELECT. $pretty/$cte/$str_literal fire
-# 1 event each; $batched_input runs two SELECTs in one PQexec so fires 2.
-# Total: 5 events, 5 log lines.
 open(my $fh, '<', $log_path) or die "cannot open $log_path: $!";
 my @lines = <$fh>;
 close $fh;
 
+# 3 single-statement triggers above + 2 events from the batched run = 5.
 is(scalar @lines, 5,
    'one log line per trap event regardless of newlines in query text');
 

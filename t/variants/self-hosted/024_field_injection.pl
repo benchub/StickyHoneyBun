@@ -1,9 +1,15 @@
+# Variants: self-hosted, rds
+# (The plant+SELECT+JSON-shape body lives in t/lib/SHB_Assertions.pm and
+# also runs against the RDS variant from t/variants/rds/024_field_injection.pl.
+# The exact byte-for-byte round-trip checks below are self-hosted-specific.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
-use Test::More;
+use SHB_Assertions;
 use JSON::PP;
+use Test::More;
 
 # The `query` field's JSON-safety is locked down by t/017/021/022. Other
 # fields of the alert object also carry user-influenced bytes and must be
@@ -37,59 +43,74 @@ sticky_honey_bun.heartbeat_interval_seconds = 0
 $node->start;
 
 # Plant rows whose tag bytes would corrupt the JSON line if unescaped.
-my $tag_inject = '","event":"forged","tag":"x"';
-my $tag_multi  = "line1\nline2\n{\"nested\":\"json\"}";
+# Each row uses a unique recognizable prefix so $get_event can find it
+# by needle even when the suffix bytes are funky.
+my $tag_inject_base = 'shb_inject_field_tag1';
+my $tag_inject      = $tag_inject_base . '","event":"forged","tag":"x"';
+
+my $tag_multi_base = 'shb_inject_field_tag2';
+my $tag_multi      = $tag_multi_base . qq{\nforged\n{"nested":"json"}};
+
+my $tag_app = 'shb_inject_field_appname.public.t.honey';
 
 $node->safe_psql('postgres', qq{
     CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
     INSERT INTO t VALUES (1, '$tag_inject');
-    INSERT INTO t VALUES (2, E'line1\\nline2\\n{"nested":"json"}');
+    INSERT INTO t VALUES (2, E'${tag_multi_base}\\nforged\\n{"nested":"json"}');
+    INSERT INTO t VALUES (3, '$tag_app');
 });
 
-# Three triggers: tag-injection row, multi-line-tag row, then a third
-# trigger with a JSON-corrupting application_name SET on the session.
+my $run_psql = sub { $node->psql('postgres', $_[0]) };
+
+my $get_event = sub {
+    my ($needle) = @_;
+    return undef unless -e $log_path && -s $log_path;
+    open my $fh, '<', $log_path or die "cannot open $log_path: $!";
+    my @lines = <$fh>;
+    close $fh;
+    for my $line (@lines) {
+        next unless index($line, $needle) >= 0;
+        my $event = eval { decode_json($line) };
+        return $@ ? undef : $event;
+    }
+    return undef;
+};
+
+# Tag carrying JSON-close-brace + forged event key.
+SHB_Assertions::assert_alert_fields(
+    $run_psql, $get_event,
+    needle  => $tag_inject_base,    # funky suffix bytes need a clean needle
+    tag     => $tag_inject,
+    trigger => 'SELECT * FROM t WHERE id = 1',
+    label   => 'tag carrying JSON-close-brace + forged event key');
+
+# Tag with embedded newlines + JSON content.
+SHB_Assertions::assert_alert_fields(
+    $run_psql, $get_event,
+    needle  => $tag_multi_base,
+    tag     => $tag_multi,
+    trigger => 'SELECT * FROM t WHERE id = 2',
+    label   => 'tag carrying newlines + JSON content');
+
+# application_name injection — the GUC is user-settable and contributes
+# to the alert payload. Funky bytes there must be JSON-escaped too.
 my $app_inject = '","event":"forged"';
+SHB_Assertions::assert_alert_fields(
+    $run_psql, $get_event,
+    tag      => $tag_app,
+    trigger  => qq{SET application_name = '$app_inject'; SELECT * FROM t WHERE id = 3;},
+    expected => { application_name => $app_inject },
+    label    => 'application_name carrying JSON-close-brace + forged event');
 
-$node->safe_psql('postgres', 'SELECT * FROM t WHERE id = 1');
-$node->safe_psql('postgres', 'SELECT * FROM t WHERE id = 2');
-$node->safe_psql('postgres',
-    qq{SET application_name = '$app_inject'; SELECT * FROM t WHERE id = 1;});
-
+# Self-hosted-specific: exactly N log lines for N triggers (no forged or
+# split events anywhere in the file).
 open(my $fh, '<', $log_path) or die "cannot open $log_path: $!";
 my @lines = <$fh>;
 close $fh;
 
 is(scalar @lines, 3,
    'one log line per trap event regardless of tag / app_name content');
-
-my $json = JSON::PP->new;
-my @parsed;
-for my $i (0 .. $#lines) {
-    my $line = $lines[$i];
-    chomp $line;
-    my $obj = eval { $json->decode($line) };
-    ok($obj, sprintf('line %d parses as standalone JSON', $i + 1))
-        or diag "decode error: $@\nline: $line";
-    push @parsed, $obj if $obj;
-}
-
-# Tag round-trip.
-is($parsed[0]{tag}, $tag_inject,
-   'tag with JSON-corrupting bytes round-trips verbatim');
-is($parsed[1]{tag}, $tag_multi,
-   'tag with embedded newlines and JSON content round-trips verbatim');
-
-# application_name round-trip on the third event.
-is($parsed[2]{application_name}, $app_inject,
-   'application_name with JSON-corrupting bytes round-trips verbatim');
-
-# Critical: outer alert object's identity-bearing fields are not hijacked
-# by anything in the user-controlled bytes.
-for my $i (0 .. $#parsed) {
-    is($parsed[$i]{event}, 'read_text',
-       sprintf('line %d event is read_text (not forged from any field)', $i + 1));
-}
 
 $node->stop;
 done_testing();

@@ -126,7 +126,18 @@ BEGIN
         'event',            'read_text',
         'tag',              tag,
         'session_user',     session_user::text,
-        'current_user',     current_user::text,
+        -- SECURITY DEFINER changes `current_user` to the function
+        -- owner — so a naive `current_user::text` would report the
+        -- extension owner even when the caller has done SET ROLE.
+        -- Reconstruct the caller's real current_user from the `role`
+        -- GUC: it persists across the SECURITY DEFINER boundary and
+        -- holds the SET ROLE target ('none' when no role pivot is in
+        -- effect, in which case current_user == session_user for the
+        -- caller).
+        'current_user',     CASE WHEN current_setting('role') = 'none'
+                                 THEN session_user::text
+                                 ELSE current_setting('role')
+                            END,
         'application_name', current_setting('application_name', true),
         'database',         current_database()::text,
         'pid',              pg_backend_pid(),
@@ -134,7 +145,17 @@ BEGIN
         'query',            current_query(),
         'cluster_id',       coalesce(cluster_id,
                                     inet_server_addr()::text,
-                                    'unknown')
+                                    'unknown'),
+        -- Always-populated per-node identifier. cluster_id is meant
+        -- for cross-cluster fan-in routing, and on an RDS read replica
+        -- it inherits the primary's value (the config table is WAL-
+        -- replicated). server_addr is the address of the actual
+        -- PostgreSQL backend that handled the read — different per
+        -- node within a cluster, so alerts from a primary vs a
+        -- replica are always distinguishable. Falls back to 'local'
+        -- for unix-socket connections (typical of self-hosted, never
+        -- happens on RDS).
+        'server_addr',      coalesce(inet_server_addr()::text, 'local')
     );
 
     BEGIN
@@ -223,20 +244,60 @@ LANGUAGE plpgsql
 AS $$
 DECLARE
     new_type regtype;
+    in_fn_name  name := 'shb_' || type_name || '_in';
+    out_fn_name name := 'shb_' || type_name || '_out';
 BEGIN
-    PERFORM pgtle.create_shell_type(type_schema, type_name);
+    -- Per-alias I/O function wrappers. Two pg_tle constraints force
+    -- this indirection:
+    --   1. "type input functions must exist in the same namespace as
+    --      the type" — pg_tle.create_base_type rejects an alias in
+    --      schema X whose input function lives in schema Y. So the
+    --      wrappers go in the alias's own schema.
+    --   2. pg_tle's internal wrapper construction reuses the user-
+    --      supplied function name, so passing the canonical
+    --      `honey_bun_in_rds` for every alias produces "function
+    --      already exists" on the second alias. Per-alias names sidestep
+    --      that collision.
+    -- The wrappers are thin SQL delegates back to the canonical
+    -- honey_bun_in_rds / honey_bun_out_rds in public — the heavy
+    -- logic (has_type_privilege guard, Lambda invoke) stays in one
+    -- place rather than being duplicated per alias.
+    EXECUTE format(
+        'CREATE FUNCTION %I.%I(input text) RETURNS bytea '
+     || 'LANGUAGE sql IMMUTABLE STRICT '
+     || 'AS ''SELECT public.honey_bun_in_rds(input)''',
+        type_schema, in_fn_name);
+    EXECUTE format(
+        'CREATE FUNCTION %I.%I(stored bytea) RETURNS text '
+     || 'LANGUAGE sql IMMUTABLE STRICT '
+     || 'AS ''SELECT public.honey_bun_out_rds(stored)''',
+        type_schema, out_fn_name);
+
+    -- pg_tle's create_shell_type / create_base_type declare their first
+    -- arg as `regnamespace`. PG resolves a bare string literal to either
+    -- `name` OR `regnamespace` at parse time, but a PL/pgSQL variable of
+    -- type `name` does NOT implicitly cast to regnamespace at
+    -- function-call resolution time — `function pgtle.create_shell_type
+    -- (name, name) does not exist`. Explicit cast makes the dispatch
+    -- unambiguous.
+    PERFORM pgtle.create_shell_type(type_schema::regnamespace, type_name);
     PERFORM pgtle.create_base_type(
-        type_schema,
-        type_name,
-        'honey_bun_in_rds(text)'::regprocedure,
-        'honey_bun_out_rds(bytea)'::regprocedure,
-        -1
-    );
+        type_schema::regnamespace, type_name,
+        format('%I.%I(text)',  type_schema, in_fn_name)::regprocedure,
+        format('%I.%I(bytea)', type_schema, out_fn_name)::regprocedure,
+        -1);
+
     new_type := format('%I.%I', type_schema, type_name)::regtype;
     INSERT INTO honey_bun_registry VALUES (new_type);
     -- Mirror the canonical type's USAGE lockdown so an alias doesn't
-    -- reopen the indirect-forge path.
+    -- reopen the indirect-forge path, and REVOKE EXECUTE on the
+    -- per-alias delegates so they're not a back door around the I/O
+    -- function ACL.
     EXECUTE format('REVOKE USAGE ON TYPE %s FROM PUBLIC', new_type);
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %I.%I(text) FROM PUBLIC',
+        type_schema, in_fn_name);
+    EXECUTE format('REVOKE EXECUTE ON FUNCTION %I.%I(bytea) FROM PUBLIC',
+        type_schema, out_fn_name);
     RETURN new_type;
 END;
 $$;

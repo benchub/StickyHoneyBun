@@ -7,6 +7,7 @@ use warnings;
 use lib 't/lib';
 use SHB;
 use SHB_Assertions;
+use JSON::PP;
 use Test::More;
 
 my $log_path = SHB::tempdir() . '/shb.log';
@@ -22,27 +23,30 @@ $node->start;
 
 $node->safe_psql('postgres', 'CREATE EXTENSION sticky_honey_bun');
 
-# Cross-variant assertion. Wrappers:
-#   $run_psql: $node->psql returns ($rc, $stdout, $stderr) — direct fit.
-#   $get_alert: tail the log file for a line containing the tag. The
+# Cross-variant assertion wrappers:
+#   $run_psql:  $node->psql returns ($rc, $stdout, $stderr) — direct fit.
+#   $get_event: tail the log file for a line containing the tag and
+#       return the decoded JSON hashref (or undef on miss). The
 #       self-hosted logger writes synchronously, so by the time the
 #       SELECT in assert_text_trip returns, the alert is already on
-#       disk; no polling needed.
-my $get_alert = sub {
+#       disk — no polling needed.
+my $get_event = sub {
     my ($tag) = @_;
-    return '' unless -e $log_path && -s $log_path;
+    return undef unless -e $log_path && -s $log_path;
     open my $fh, '<', $log_path or die "cannot open $log_path: $!";
     my @lines = <$fh>;
     close $fh;
     for my $line (@lines) {
-        return $line if index($line, $tag) >= 0;
+        next unless index($line, $tag) >= 0;
+        my $event = eval { decode_json($line) };
+        return $@ ? undef : $event;
     }
-    return '';
+    return undef;
 };
 
 SHB_Assertions::assert_text_trip(
     sub { $node->psql('postgres', $_[0]) },
-    $get_alert,
+    $get_event,
     'public.t.honey',
     label => 'public.t honey row text-trip (self-hosted)');
 

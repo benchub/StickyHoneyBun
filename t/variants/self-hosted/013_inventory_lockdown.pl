@@ -1,7 +1,13 @@
+# Variants: self-hosted, rds
+# (The "non-privileged role denied honey_bun_columns" body lives in
+# t/lib/SHB_Assertions.pm and also runs against the RDS variant from
+# t/variants/rds/013_inventory_lockdown.pl.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
+use SHB_Assertions;
 use Test::More;
 
 # The honey_bun_columns view enumerates every planted honey column under
@@ -35,13 +41,14 @@ my $admin_count = $node->safe_psql('postgres',
 is($admin_count, '2',
    'superuser still sees the full inventory (canonical + alias)');
 
-# app_user has no rights to SELECT from honey_bun_columns.
-my ($rc, $stdout, $stderr) = $node->psql('postgres',
-    'SELECT * FROM honey_bun_columns',
-    extra_params => ['-U', 'app_user']);
-isnt($rc, 0, 'non-privileged role cannot SELECT from honey_bun_columns');
-like($stderr, qr/permission denied/i,
-     'denial is a permission error, not a missing-object error');
+# Wrap $node->psql to run queries as the non-privileged app_user role.
+my $as_app_user = sub {
+    $node->psql('postgres', $_[0], extra_params => ['-U', 'app_user']);
+};
+
+SHB_Assertions::assert_inventory_locked_from_role(
+    $as_app_user,
+    'app_user denied honey_bun_columns access');
 
 # Once explicitly granted, the audit role can use it.
 $node->safe_psql('postgres',

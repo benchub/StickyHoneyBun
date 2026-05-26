@@ -308,9 +308,33 @@ def main():
 
     # Order matters: RDS instance first (and wait), then subnet group +
     # parameter group, then Lambda + IAM + SG in any order.
+    #
+    # Within rds_db, replicas must be deleted BEFORE their source primary
+    # (RDS rejects delete_db_instance on a primary with live replicas).
+    # We sort by inspecting each instance's
+    # ReadReplicaSourceDBInstanceIdentifier — replicas have it set, the
+    # primary does not.
     errors = []
 
-    for _, instance_id, _ in found.get("rds_db", []):
+    rds_dbs = found.get("rds_db", [])
+    replicas, primaries = [], []
+    for entry in rds_dbs:
+        _, instance_id, _ = entry
+        try:
+            resp = rds.describe_db_instances(DBInstanceIdentifier=instance_id)
+            inst = resp["DBInstances"][0]
+            if inst.get("ReadReplicaSourceDBInstanceIdentifier"):
+                replicas.append(entry)
+            else:
+                primaries.append(entry)
+        except Exception:
+            # If the instance is mid-deletion or unreachable, assume
+            # it's a primary so we attempt the delete last (worst case
+            # we get a no-op error). Replicas mid-deletion sort the same
+            # way; the wait inside delete_rds_instance handles it.
+            primaries.append(entry)
+
+    for _, instance_id, _ in replicas + primaries:
         try:
             delete_rds_instance(rds, instance_id, args.run_id)
         except Exception as e:

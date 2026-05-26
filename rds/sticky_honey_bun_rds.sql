@@ -10,11 +10,24 @@
 --   - aws_lambda extension installed (CREATE EXTENSION aws_lambda).
 --   - IAM role attached to the RDS instance with lambda:InvokeFunction on the
 --     target Lambda.
---   - Custom GUC sticky_honey_bun_rds.lambda_arn set in the parameter group.
 --
 -- Installation:
 --   psql ... -f sticky_honey_bun_rds.sql
 --   CREATE EXTENSION sticky_honey_bun_rds;
+--   -- Then populate the locked-down config table (PUBLIC has no access;
+--   -- run as the extension owner):
+--   INSERT INTO sticky_honey_bun_rds_config(key, value) VALUES
+--     ('lambda_arn', 'arn:aws:lambda:REGION:ACCOUNT:function:NAME'),
+--     ('cluster_id', 'my-cluster')   -- optional
+--   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+--
+-- Configuration storage rationale: RDS rejects custom-namespace GUCs in
+-- parameter groups, and `ALTER DATABASE/ROLE SET sticky_honey_bun_rds.foo`
+-- errors with "permission denied to set parameter". Even if those routes
+-- worked, custom-namespace GUCs are user-settable per session, so an
+-- attacker could SET sticky_honey_bun_rds.lambda_arn = '' to silence
+-- their own queries. A locked-down config table read via SECURITY DEFINER
+-- is the tamper-resistant alternative.
 
 SELECT pgtle.install_extension(
     'sticky_honey_bun_rds',
@@ -31,7 +44,14 @@ BEGIN
     -- is insufficient to block 'forged'::honey_bun. Require USAGE on the
     -- canonical honey_bun type; admins who grant USAGE on an alias only
     -- should also grant on canonical (the simpler model).
-    IF NOT has_type_privilege(current_user, 'honey_bun'::regtype, 'USAGE') THEN
+    -- Defer the type lookup to call time. With `'honey_bun'::regtype`
+    -- (or even bare `'honey_bun'` if PG picks the oid overload of
+    -- has_type_privilege), the type name is resolved at function-parse
+    -- time — too early during CREATE EXTENSION because honey_bun isn't
+    -- created until pgtle.create_base_type runs further down in this
+    -- install body. Force the text-name overload with explicit ::text
+    -- on the literal so PG doesn't try the oid path.
+    IF NOT has_type_privilege(current_user, 'honey_bun'::text, 'USAGE') THEN
         RAISE EXCEPTION 'permission denied for type honey_bun'
             USING ERRCODE = 'insufficient_privilege';
     END IF;
@@ -39,21 +59,66 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 
+-- Locked-down config table. Holds lambda_arn and cluster_id (and any
+-- future config) per-database. PUBLIC has NO access; an attacker
+-- session cannot read these values to discover the Lambda ARN, and
+-- cannot UPDATE them to silence the trap. The trap function below
+-- reads this table via SECURITY DEFINER, running as the extension's
+-- owner (which has SELECT by default), so legitimate trap fires still
+-- work.
+--
+-- This replaces the GUC-based config the earlier RDS variant used.
+-- On RDS, custom-namespace GUCs are settable per-session by any role
+-- (`SET sticky_honey_bun_rds.lambda_arn = ''` would silence the trap
+-- for an attacker's own queries), and rds_superuser cannot set them
+-- at the database/role level either ("permission denied to set
+-- parameter"). A locked-down table is the tamper-resistant alternative.
+CREATE TABLE sticky_honey_bun_rds_config (
+    key   text PRIMARY KEY,
+    value text
+);
+REVOKE ALL ON sticky_honey_bun_rds_config FROM PUBLIC;
+COMMENT ON TABLE sticky_honey_bun_rds_config IS
+    'Locked-down config for sticky_honey_bun_rds. PUBLIC has no access. '
+    'Modify as the extension owner: INSERT INTO sticky_honey_bun_rds_config '
+    'VALUES (''lambda_arn'', ''arn:aws:lambda:...''), '
+    '(''cluster_id'', ''my-cluster'') '
+    'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;';
+
+-- IMMUTABLE is technically a lie (we read a table and invoke a Lambda),
+-- but PG enforces that typeoutput functions be IMMUTABLE. Same trade-off
+-- the C variant makes — see README's "I/O functions are declared
+-- IMMUTABLE" note. Constant-folding doesn't apply to the executor's
+-- typoutput dispatch path (SELECT/COPY/pg_dump), so the side effect
+-- still fires per row.
 CREATE FUNCTION honey_bun_out_rds(stored bytea)
 RETURNS text
+LANGUAGE plpgsql
+IMMUTABLE STRICT
+SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    tag     text := convert_from(stored, 'UTF8');
-    arn     text := current_setting('sticky_honey_bun_rds.lambda_arn', true);
-    payload jsonb;
+    tag        text := convert_from(stored, 'UTF8');
+    arn        text;
+    cluster_id text;
+    payload    jsonb;
 BEGIN
-    -- No kill-switch GUC: pg_tle base extensions cannot register GUCs with
-    -- PGC_POSTMASTER context, so any "enabled" flag would be settable per
-    -- session via SET and trivially bypassable. Disabling on RDS is a
-    -- DROP EXTENSION (or unsetting lambda_arn) operation.
+    -- Read locked-down config. PUBLIC cannot reach this table directly,
+    -- but SECURITY DEFINER means we run as the extension owner, which has
+    -- SELECT by default. An attacker session cannot silence the trap by
+    -- modifying these values — they have no GRANTs.
+    SELECT value INTO arn
+      FROM sticky_honey_bun_rds_config
+     WHERE key = 'lambda_arn';
     IF arn IS NULL OR arn = '' THEN
+        -- No Lambda configured — return the tag without firing. Lets the
+        -- extension be installed before the Lambda exists.
         RETURN tag;
     END IF;
+    SELECT value INTO cluster_id
+      FROM sticky_honey_bun_rds_config
+     WHERE key = 'cluster_id';
 
     payload := jsonb_build_object(
         'ts',               to_char(clock_timestamp() AT TIME ZONE 'UTC',
@@ -67,11 +132,9 @@ BEGIN
         'pid',              pg_backend_pid(),
         'client_addr',      coalesce(inet_client_addr()::text, 'local'),
         'query',            current_query(),
-        'cluster_id',       coalesce(
-                                current_setting('sticky_honey_bun_rds.cluster_id', true),
-                                inet_server_addr()::text,
-                                'unknown'
-                            )
+        'cluster_id',       coalesce(cluster_id,
+                                    inet_server_addr()::text,
+                                    'unknown')
     );
 
     BEGIN
@@ -88,7 +151,7 @@ BEGIN
 
     RETURN tag;
 END;
-$$ LANGUAGE plpgsql IMMUTABLE STRICT;
+$$;
 
 -- Mirror of the self-hosted variant's I/O-function lockdown. PG's typinput
 -- and typoutput dispatch paths bypass function ACLs, so the REVOKE alone
@@ -97,6 +160,11 @@ $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 -- SELECT honey_bun_in_rds(...) call path.
 REVOKE EXECUTE ON FUNCTION honey_bun_in_rds(text)   FROM PUBLIC;
 REVOKE EXECUTE ON FUNCTION honey_bun_out_rds(bytea) FROM PUBLIC;
+
+-- pg_tle requires a shell type to exist before create_base_type can
+-- promote it to a full base type. The shell type lets the I/O functions'
+-- has_type_privilege check resolve the name when they're called later.
+SELECT pgtle.create_shell_type('public', 'honey_bun');
 
 SELECT pgtle.create_base_type(
     'public',
@@ -156,6 +224,7 @@ AS $$
 DECLARE
     new_type regtype;
 BEGIN
+    PERFORM pgtle.create_shell_type(type_schema, type_name);
     PERFORM pgtle.create_base_type(
         type_schema,
         type_name,

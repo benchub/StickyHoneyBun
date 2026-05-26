@@ -33,9 +33,15 @@ $PSQL -c "SELECT 1 FROM pg_extension WHERE extname = 'aws_lambda'"  | grep -q 1
 $PSQL -c "SELECT 1 FROM pg_extension WHERE extname = 'sticky_honey_bun_rds'" | grep -q 1
 $PSQL -c "SELECT 1 FROM pg_type WHERE typname = 'honey_bun'"      | grep -q 1
 
-echo "==> Setting Lambda ARN for this session"
+echo "==> Configuring Lambda ARN in the locked-down config table"
+# Idempotent: upsert so re-running the smoke test against an already-
+# configured cluster doesn't trip the PK. PUBLIC has no access; we rely
+# on the connecting role being the extension owner (or having explicit
+# INSERT/UPDATE grants).
 $PSQL <<SQL
-SET sticky_honey_bun_rds.lambda_arn = '${STICKY_HONEY_BUN_LAMBDA_ARN}';
+INSERT INTO sticky_honey_bun_rds_config(key, value)
+VALUES ('lambda_arn', '${STICKY_HONEY_BUN_LAMBDA_ARN}')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 SQL
 
 echo "==> Planting a temporary honey row"

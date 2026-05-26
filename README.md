@@ -120,7 +120,7 @@ One JSON object per line (file) or per event (Lambda):
 | `pid` | backend PID | Dedup, correlation with PG's own log |
 | `client_addr` | `MyProcPort->raddr` | Primary alert processor filter key (paired with `session_user`) |
 | `query` | `debug_query_string` | Forensics; can be NULL in some internal call paths |
-| `cluster_id` | RDS variant only, set via `sticky_honey_bun_rds.cluster_id` GUC | Identifies the source cluster when one Lambda fans many in |
+| `cluster_id` | RDS variant only, set via the `sticky_honey_bun_rds_config` table (key `cluster_id`) | Identifies the source cluster when one Lambda fans many in |
 
 Heartbeat lines carry only `ts`, `event` (always `"heartbeat"`), `tag`
 (always `"heartbeat"`), and `pid`. The bgworker has no database
@@ -250,12 +250,19 @@ Prerequisites on the cluster:
 - `aws_lambda` extension.
 - IAM role on the RDS instance with `lambda:InvokeFunction` on the target
   Lambda (deploy `lambda/handler.py`).
-- Custom GUCs `sticky_honey_bun_rds.lambda_arn` (required) and
-  `sticky_honey_bun_rds.cluster_id` (optional) set in the parameter group.
 
 ```sh
 psql ... -f rds/sticky_honey_bun_rds.sql
 psql ... -c "CREATE EXTENSION sticky_honey_bun_rds"
+
+# Configure the Lambda ARN (and optional cluster_id) in the locked-down
+# config table. Run as the extension owner — PUBLIC has no access.
+psql ... <<SQL
+INSERT INTO sticky_honey_bun_rds_config(key, value) VALUES
+  ('lambda_arn', 'arn:aws:lambda:us-east-1:123456789012:function:my-shb'),
+  ('cluster_id', 'prod-us-east-1')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+SQL
 ```
 
 Then plant honey columns the same way as the self-hosted variant. Validate
@@ -284,31 +291,50 @@ All four GUCs are deliberately `PGC_POSTMASTER`: they can only be set in
 restart, which is auditable infrastructure activity rather than a quiet
 `ALTER SYSTEM` call.
 
-### GUCs (RDS variant)
+### Configuration (RDS variant)
 
-| Name | Description |
+RDS does not allow custom-namespace GUCs to be set durably (parameter
+groups reject unknown parameter names; `ALTER DATABASE/ROLE SET
+sticky_honey_bun_rds.lambda_arn = ...` errors with "permission denied
+to set parameter" even as `rds_superuser`). Worse, *if* such GUCs were
+settable per-session, any attacker could `SET sticky_honey_bun_rds.lambda_arn = ''`
+in their own session to silence the trap. The RDS variant therefore
+stores its configuration in a locked-down table:
+
+```sql
+CREATE TABLE sticky_honey_bun_rds_config (
+    key   text PRIMARY KEY,
+    value text
+);
+REVOKE ALL ON sticky_honey_bun_rds_config FROM PUBLIC;
+```
+
+| Key | Description |
 |---|---|
-| `sticky_honey_bun_rds.lambda_arn` | ARN of the Lambda to invoke on trap events. Required. |
-| `sticky_honey_bun_rds.cluster_id` | Optional identifier sent in the payload so a shared Lambda can route by source. |
+| `lambda_arn` | ARN of the Lambda to invoke on trap events. Required for alerts to fire; absent or empty disables alerting (the trap returns the tag transparently). |
+| `cluster_id` | Optional identifier emitted in the payload so a shared Lambda can route by source cluster. |
 
-The RDS variant intentionally has no `enabled` kill switch. pg_tle base
-extensions cannot register GUCs with `PGC_POSTMASTER` context, so any
-runtime-settable flag would be trivially bypassable by an attacker
-(`SET sticky_honey_bun_rds.enabled = off`). To turn the RDS trap off,
-`DROP EXTENSION sticky_honey_bun_rds`. The `lambda_arn` GUC has the same
-exposure — a session can `SET sticky_honey_bun_rds.lambda_arn = ''` to
-suppress alerts for its own queries — which is a hard limitation of the
-pg_tle path. Defense in depth: keep the RDS role grants narrow so non-admin
-sessions can't reach the catalog state.
+The output function `honey_bun_out_rds` runs `SECURITY DEFINER` and reads
+this table as the extension owner. PUBLIC has no `SELECT`, `INSERT`,
+`UPDATE`, or `DELETE` on the config table, so an attacker session cannot
+read the Lambda ARN, cannot silence the trap by emptying it, and cannot
+redirect alerts by overwriting it. Configuration changes go through the
+extension owner.
 
-The RDS install script mirrors the self-hosted variant's lockdown where the
-mechanism translates: `REVOKE EXECUTE` on `honey_bun_in_rds`/`honey_bun_out_rds`
-and on `create_honey_bun_alias`; `REVOKE USAGE` on the `honey_bun` type and
-on every alias created by `create_honey_bun_alias`; and a `has_type_privilege`
-check inside `honey_bun_in_rds` (the PL/pgSQL analog of the C variant's
-`pg_type_aclcheck`, since pg_tle's typinput dispatch bypasses function ACLs
-the same way PG's native typinput dispatch does). Planter roles need an
-explicit `GRANT USAGE ON TYPE honey_bun` to insert honey values.
+The RDS variant intentionally has no `enabled` kill switch. To disable
+the trap, `DROP EXTENSION sticky_honey_bun_rds` (auditable infrastructure
+activity) or `DELETE FROM sticky_honey_bun_rds_config WHERE key =
+'lambda_arn'` as the owner.
+
+The RDS install script mirrors the self-hosted variant's lockdown where
+the mechanism translates: `REVOKE EXECUTE` on `honey_bun_in_rds` /
+`honey_bun_out_rds` and on `create_honey_bun_alias`; `REVOKE USAGE` on
+the `honey_bun` type and on every alias created by
+`create_honey_bun_alias`; and a `has_type_privilege` check inside
+`honey_bun_in_rds` (the PL/pgSQL analog of the C variant's
+`pg_type_aclcheck`, since pg_tle's typinput dispatch bypasses function
+ACLs the same way PG's native typinput dispatch does). Planter roles
+need an explicit `GRANT USAGE ON TYPE honey_bun` to insert honey values.
 
 ## Build
 
@@ -390,6 +416,20 @@ behavior under test, and asserts against the log file or DB state.
 
 The RDS variant has a manual smoke test (`rds/smoke_test.sh`) since it
 requires a real RDS/Aurora cluster with `pg_tle` and `aws_lambda`.
+
+### Online RDS test (real AWS resources)
+
+`rds/online/` provisions a real RDS instance + Lambda + IAM + security
+group in your AWS account, runs the assertions that map across from the
+self-hosted suite, then tears everything down. Costs a few cents per
+run. See `rds/online/README.md` for the env-var contract and the
+multi-layer cleanup story (tag-based discovery, refuse-if-tag-mismatch
+delete, always-fire `END {}` block, `make rds-list-orphans` safety net).
+
+```sh
+# Once your AWS creds + VPC/subnet are in the env:
+make rds-test-online
+```
 
 ### TDD discipline
 

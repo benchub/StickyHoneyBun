@@ -26,6 +26,8 @@ help:
 	@echo "  docker-clean         remove tagged docker images"
 	@echo "  install              install locally-built extension (after 'local')"
 	@echo "  clean                remove local build artifacts"
+	@echo "  rds-test-online      provision real RDS + Lambda and run online tests (costs money)"
+	@echo "  rds-list-orphans     list AWS resources from previous online test runs"
 	@echo ""
 	@echo "Overrides:"
 	@echo "  PG_VERSIONS=\"...\"        versions for docker-matrix"
@@ -119,3 +121,16 @@ docker-test-ubsan-$(1):
 		.
 endef
 $(foreach v,$(PG_TEST_VERSIONS),$(eval $(call DOCKER_TEST_UBSAN_TARGET,$(v))))
+
+# RDS online test: provisions real AWS resources (RDS instance + Lambda +
+# IAM + SG + parameter groups) via boto3, runs assertions, tears down.
+# Requires AWS_{ACCESS_KEY_ID,SECRET_ACCESS_KEY,SESSION_TOKEN}, AWS_REGION,
+# SHB_TEST_VPC_ID, SHB_TEST_SUBNET_IDS. See rds/online/README or the
+# script docstrings for the full env contract.
+.PHONY: rds-test-online rds-list-orphans
+rds-test-online:
+	@echo "==> RDS online test"
+	@perl rds/online/run.pl
+
+rds-list-orphans:
+	@rds/online/.venv/bin/python3 rds/online/list_orphans.py

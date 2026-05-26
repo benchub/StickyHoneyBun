@@ -1,7 +1,13 @@
+# Variants: self-hosted, rds
+# (The "direct I/O function call denied" body is the cross-variant
+# assertion in t/lib/SHB_Assertions.pm; the alias _send / _out coverage
+# and the log-size-unchanged checks are self-hosted-specific.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
+use SHB_Assertions;
 use Test::More;
 
 # honey_bun_out and honey_bun_send are PostgreSQL type-system primitives
@@ -47,27 +53,30 @@ sub log_size {
     return -s $log_path;
 }
 
+# Wraps $node->psql so the shared assertion can run the call as the
+# non-superuser `attacker` role. SET ROLE survives only within one
+# psql session, so the wrapper prepends it to every call.
+my $as_attacker = sub {
+    $node->psql('postgres', "SET ROLE attacker; $_[0]");
+};
+
 # Direct call to honey_bun_out as a non-superuser. Today: succeeds and
 # writes a forged log line. After fix: ERROR with permission denied, log
 # file unchanged.
 my $size_before = log_size();
-my ($rc_out, undef, $stderr_out) = $node->psql('postgres',
-    q{SET ROLE attacker; SELECT honey_bun_out('forged.tag'::honey_bun);});
-isnt($rc_out, 0,
-    'non-superuser direct call to honey_bun_out fails');
-like($stderr_out, qr/permission denied/i,
-    'honey_bun_out errors with permission denied');
+SHB_Assertions::assert_io_function_call_denied(
+    $as_attacker,
+    "SELECT honey_bun_out('forged.tag'::honey_bun)",
+    'non-superuser direct call to honey_bun_out');
 is(log_size(), $size_before,
     'failed honey_bun_out call does not write a log entry');
 
 # Same for honey_bun_send.
 $size_before = log_size();
-my ($rc_send, undef, $stderr_send) = $node->psql('postgres',
-    q{SET ROLE attacker; SELECT honey_bun_send('forged.tag'::honey_bun);});
-isnt($rc_send, 0,
-    'non-superuser direct call to honey_bun_send fails');
-like($stderr_send, qr/permission denied/i,
-    'honey_bun_send errors with permission denied');
+SHB_Assertions::assert_io_function_call_denied(
+    $as_attacker,
+    "SELECT honey_bun_send('forged.tag'::honey_bun)",
+    'non-superuser direct call to honey_bun_send');
 is(log_size(), $size_before,
     'failed honey_bun_send call does not write a log entry');
 
@@ -86,12 +95,10 @@ $node->safe_psql('postgres',
     q{SELECT create_honey_bun_alias('account_token');});
 
 $size_before = log_size();
-my ($rc_alias, undef, $stderr_alias) = $node->psql('postgres',
-    q{SET ROLE attacker; SELECT account_token_out('forged'::account_token);});
-isnt($rc_alias, 0,
-    'non-superuser direct call to alias-generated _out fails');
-like($stderr_alias, qr/permission denied/i,
-    'alias _out errors with permission denied');
+SHB_Assertions::assert_io_function_call_denied(
+    $as_attacker,
+    "SELECT account_token_out('forged'::account_token)",
+    'non-superuser direct call to alias-generated _out');
 is(log_size(), $size_before,
     'failed alias _out call does not write a log entry');
 

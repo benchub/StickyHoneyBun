@@ -20,38 +20,9 @@ first run.
 | `teardown.py` | tag-discovery-based cleanup; refuses to delete anything whose tag doesn't match |
 | `list_orphans.py` | safety-net inspector — lists resources from any past test run still in AWS |
 | `poll_alert.py` | polls Lambda's CloudWatch log group for a needle string |
-| `run.pl` | entry point. Thin orchestrator: preflight → setup → `prove rds/online/t/*.pl` → teardown |
-| `lib/SHB_RDS.pm` | shared helpers for the test files (`load_state`, `connstr`, `psql_run`, `poll_alert`, `schema_setup`, `unique_tag`) |
-| `t/*.pl` | per-concern TAP tests, parallel-numbered with `t/*.pl` where the concern applies to both variants |
+| `run.pl` | entry point. Thin orchestrator: preflight → setup → `prove t/variants/rds/*.pl` → teardown |
 
-## Test file layout
-
-Each test file under `rds/online/t/` is a standalone TAP script driven
-by `prove`. Setup and teardown are once-per-run (not per-file), so
-files share the RDS cluster the orchestrator provisions.
-
-Conventions every test file follows:
-
-1. **Variant header on line 2**: `# Variants: rds` (RDS-only) or
-   `# Variants: self-hosted, rds` (concern applies to both — the
-   assertion body lives in `t/lib/SHB_Assertions.pm` and both sides
-   call it).
-2. **`use lib 'rds/online/lib';`** then **`use SHB_RDS;`** to get the
-   helpers. Tests that share assertions with the self-hosted variant
-   also `use lib 't/lib'; use SHB_Assertions;`.
-3. **`my $st = SHB_RDS::load_state();`** reads the `state-<run_id>.json`
-   the orchestrator just wrote. `$ENV{SHB_RUN_ID}` is exported by
-   `run.pl` before invoking `prove`.
-4. **Schema-per-file isolation**: tests that create tables call
-   `my $cs = SHB_RDS::schema_setup($st, 'shb_t003')`. The helper drops
-   any prior schema, creates a fresh one, and returns a connstr with
-   `search_path` baked in via the `options` URI param. Tables inside
-   use natural names (`t`, `customers`) without prefix collisions.
-5. **`done_testing()`** at the bottom — no fixed plan count.
-
-Numbering: RDS files share numbers with their self-hosted counterparts
-when the concern applies to both (so `t/003_text_trip.pl` ↔
-`rds/online/t/003_text_trip.pl`). RDS-only concerns start at 800.
+The test files themselves live under `t/variants/rds/*.pl`; the helpers they call (`SHB_RDS.pm`, the cross-variant `SHB_Assertions.pm`, the self-hosted-only `SHB.pm`) all live together under `t/lib/`. See `t/variants/README.md` for the test-file conventions.
 
 ## Environment
 

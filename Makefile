@@ -5,6 +5,11 @@ EXTENSION = sticky_honey_bun
 DATA = sql/sticky_honey_bun--1.0.sql
 
 TAP_TESTS = 1
+# Self-hosted TAP tests now live under t/variants/self-hosted/. PGXS
+# defaults PROVE_TESTS to t/*.pl, but t/*.pl no longer exists — the only
+# files directly under t/ are the lib/ subdir and t/variants/. Override
+# the glob so prove finds the right tests.
+PROVE_TESTS = t/variants/self-hosted/*.pl
 
 PG_CONFIG ?= pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)

@@ -1,16 +1,19 @@
 #!/usr/bin/perl
-# Variants: rds
+# Variants: self-hosted, rds
 # Asserts: USAGE on honey_bun gates planting but not reading.
 #          - Deployer (USAGE + EXECUTE granted) can cast to honey_bun.
-#          - App role (no USAGE) cannot cast.
+#          - App role (no USAGE) cannot cast — the cross-variant
+#            "cast denied" body is in t/lib/SHB_Assertions.pm.
 #          - App role with SELECT on a honey-bearing table still reads
-#            successfully and the read fires the trap.
+#            successfully and the read fires the trap (RDS-specific
+#            evidence; self-hosted counterpart is in t/023).
 
 use strict;
 use warnings;
-use lib 'rds/online/lib';
+use lib 't/lib';
 use Test::More;
 use SHB_RDS;
+use SHB_Assertions;
 
 my $st = SHB_RDS::load_state();
 my $cs_master = SHB_RDS::schema_setup($st, 'shb_t023');
@@ -33,18 +36,18 @@ my $cs_master = SHB_RDS::schema_setup($st, 'shb_t023');
 # App role cannot plant: REVOKE USAGE FROM PUBLIC means a role without
 # an explicit grant can't construct honey_bun values. The has_type_
 # privilege check inside honey_bun_in_rds enforces this even though
-# pg_tle's typinput dispatch path bypasses function ACLs.
+# pg_tle's typinput dispatch path bypasses function ACLs. The shared
+# assertion checks both the failure rc and the permission-denied
+# message shape; same body runs against the C variant from t/023.
 {
-    my $cs = SHB_RDS::connstr($st,
+    my $cs_app = SHB_RDS::connstr($st,
         user        => 'shbtest_app',
         password    => $st->{app_password},
         search_path => 'shb_t023');
-    my $tag = SHB_RDS::unique_tag($st, 'appcast');
-    my ($rc, $out, $err) = SHB_RDS::psql_run(
-        $cs, "SELECT '$tag'::honey_bun IS NOT NULL");
-    isnt($rc, 0, 'app role cannot cast to honey_bun');
-    like($err, qr/permission denied/i,
-        'app role cast fails with permission denied');
+    SHB_Assertions::assert_cast_to_type_denied(
+        sub { SHB_RDS::psql_run($cs_app, $_[0]) },
+        'honey_bun',
+        'app-role cast to honey_bun');
 }
 
 # App role CAN read existing honey-bearing tables — typeoutput dispatch

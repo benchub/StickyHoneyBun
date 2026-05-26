@@ -116,13 +116,21 @@ def lambda_handler(event: dict, context: Any) -> dict:
 
     kind = event.get("event")
 
+    # Use compact separators so the emitted JSON matches the self-hosted
+    # C variant byte-for-byte. The README documents "Both variants ship
+    # the same JSON event shape"; without this, json.dumps' default ", "
+    # / ": " separators add whitespace that downstream consumers and
+    # cross-variant regex assertions don't tolerate.
+    compact = lambda obj: json.dumps(obj, sort_keys=True,
+                                     separators=(',', ':'))
+
     if kind == "heartbeat":
         if _log_heartbeats:
-            logger.info("shb_heartbeat %s", json.dumps(event, sort_keys=True))
+            logger.info("shb_heartbeat %s", compact(event))
         return {"statusCode": 200, "body": "heartbeat"}
 
     # Trap trip. Log at WARNING so it stands out in CloudWatch metric filters.
-    logger.warning("shb_alert %s", json.dumps(event, sort_keys=True))
+    logger.warning("shb_alert %s", compact(event))
     _publish_sns(event)
 
     return {"statusCode": 200, "body": "alert recorded"}

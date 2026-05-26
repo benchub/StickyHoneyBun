@@ -3,7 +3,7 @@
 # run.pl — orchestrate the online RDS test.
 #
 # This is the entry point invoked by `make rds-test-online`. It does
-# NOT emit TAP itself; the per-file tests under rds/online/t/ do that.
+# NOT emit TAP itself; the per-file tests under t/variants/rds/ do that.
 # Flow:
 #   1. Check that the AWS environment is present. If not, exit 0 with a
 #      SKIP message — `make` sees success, the operator sees why.
@@ -16,7 +16,7 @@
 #   5. setup.py — provision everything; write state-<run_id>.json.
 #      Under reuse, runs in --install-only mode (extension reinstall
 #      only; ~30 sec instead of ~12 min).
-#   6. Export SHB_RUN_ID and exec `prove -v rds/online/t/*.pl`. Each
+#   6. Export SHB_RUN_ID and exec `prove -v t/variants/rds/*.pl`. Each
 #      test file is a standalone TAP script that reads state from the
 #      file setup.py just wrote.
 #
@@ -168,9 +168,9 @@ if ($setup_rc != 0) {
 
 $ENV{SHB_RUN_ID} = $run_id;
 
-my @test_files = sort glob('rds/online/t/*.pl');
+my @test_files = sort glob('t/variants/rds/*.pl');
 unless (@test_files) {
-    die "no test files found under rds/online/t/\n";
+    die "no test files found under t/variants/rds/\n";
 }
 
 my $rc = system('prove', '-v', @test_files);

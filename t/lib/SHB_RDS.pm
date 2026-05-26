@@ -151,13 +151,19 @@ sub schema_setup {
     return connstr($state, %opts, search_path => $schema);
 }
 
-# unique_tag($state, $label) -> 'shbtest-<run_id>-<label>'
-# Builds a CloudWatch-greppable tag distinct from other test runs and
-# other tags within this run. The run_id keeps it globally unique; the
-# label keeps assertions within one test file distinguishable.
+# unique_tag($state, $label) -> 'shbtest-<run_id>-<label>-<pid><epoch>'
+# Builds a CloudWatch-greppable tag distinct from other test runs AND
+# from previous invocations of the same test against the same reused
+# instance. Without the pid+epoch suffix, SHB_REUSE_RUN_ID reruns
+# collide: every text-trip run plants 'shbtest-<run_id>-text_trip',
+# poll_alert's 5-minute look-back window returns the oldest match, and
+# subsequent runs end up asserting against a stale log line from a
+# previous run. The suffix forces every invocation to plant a tag no
+# prior run could have produced.
 sub unique_tag {
     my ($state, $label) = @_;
-    return "shbtest-$state->{run_id}-$label";
+    return sprintf("shbtest-%s-%s-%d%d",
+        $state->{run_id}, $label, $$, time());
 }
 
 1;

@@ -1,7 +1,14 @@
+# Variants: self-hosted, rds
+# (The "cast to a honey-shaped type denied without USAGE" body is the
+# cross-variant assertion in t/lib/SHB_Assertions.pm; the CREATE-TABLE
+# variant, alias coverage, post-GRANT regression, and log-size
+# invariants are self-hosted-specific.)
+
 use strict;
 use warnings;
 use lib 't/lib';
 use SHB;
+use SHB_Assertions;
 use Test::More;
 
 # Closing PUBLIC EXECUTE on honey_bun_out / honey_bun_send (t/018) doesn't
@@ -43,14 +50,18 @@ sub log_size {
     return -s $log_path;
 }
 
+# Wraps $node->psql so the shared assertion runs the cast as the
+# non-USAGE `attacker` role. SET ROLE is per-session, so the wrapper
+# prepends it to every call.
+my $as_attacker = sub {
+    $node->psql('postgres', "SET ROLE attacker; $_[0]");
+};
+
 # Cast attempt: 'forged'::honey_bun requires USAGE on the type.
 my $size_before = log_size();
-my ($rc_cast, undef, $stderr_cast) = $node->psql('postgres',
-    q{SET ROLE attacker; SELECT 'forged.tag'::honey_bun;});
-isnt($rc_cast, 0,
-    'non-superuser cannot cast to honey_bun');
-like($stderr_cast, qr/permission denied for (type|function)/i,
-    'cast to honey_bun errors with permission denied for type');
+SHB_Assertions::assert_cast_to_type_denied(
+    $as_attacker, 'honey_bun',
+    'attacker cast to honey_bun');
 is(log_size(), $size_before,
     'failed cast does not produce a log entry');
 
@@ -79,12 +90,9 @@ $node->safe_psql('postgres',
     q{SELECT create_honey_bun_alias('account_token');});
 
 $size_before = log_size();
-my ($rc_alias, undef, $stderr_alias) = $node->psql('postgres',
-    q{SET ROLE attacker; SELECT 'forged'::account_token;});
-isnt($rc_alias, 0,
-    'non-superuser cannot cast to alias type');
-like($stderr_alias, qr/permission denied for (type|function)/i,
-    'cast to alias type errors with permission denied');
+SHB_Assertions::assert_cast_to_type_denied(
+    $as_attacker, 'account_token',
+    'attacker cast to alias type account_token');
 is(log_size(), $size_before,
     'failed alias cast does not produce a log entry');
 

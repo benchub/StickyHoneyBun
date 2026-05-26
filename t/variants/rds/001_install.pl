@@ -8,7 +8,6 @@
 
 use strict;
 use warnings;
-use lib 'rds/online/lib';
 use lib 't/lib';
 use Test::More;
 use SHB_RDS;

@@ -293,12 +293,7 @@ restart, which is auditable infrastructure activity rather than a quiet
 
 ### Configuration (RDS variant)
 
-RDS does not allow custom-namespace GUCs to be set durably (parameter
-groups reject unknown parameter names; `ALTER DATABASE/ROLE SET
-sticky_honey_bun_rds.lambda_arn = ...` errors with "permission denied
-to set parameter" even as `rds_superuser`). Worse, *if* such GUCs were
-settable per-session, any attacker could `SET sticky_honey_bun_rds.lambda_arn = ''`
-in their own session to silence the trap. The RDS variant therefore
+`pg_tle` in RDS does not allow custom-namespace GUCs to be set durably. The RDS variant therefore
 stores its configuration in a locked-down table:
 
 ```sql

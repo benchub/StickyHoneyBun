@@ -136,13 +136,13 @@ if ($reuse) {
     print STDERR
         "reusing existing RDS instance; reinstalling extension only\n";
     ($setup_rc, undef, $setup_err) = run_cmd(
-        ['rds/online/.venv/bin/python3', 'rds/online/setup.py',
+        ['rds/online/.venv/bin/python3', '-u', 'rds/online/setup.py',
          $run_id, '--install-only'],
         1);
 } else {
     print STDERR "running preflight...\n";
     my ($pf_rc, $pf_out, $pf_err) = run_cmd(
-        ['rds/online/.venv/bin/python3', 'rds/online/preflight.py']);
+        ['rds/online/.venv/bin/python3', '-u', 'rds/online/preflight.py']);
     if ($pf_rc != 0) {
         print STDERR "preflight stderr:\n$pf_err\n";
         die "preflight failed\n";
@@ -154,7 +154,7 @@ if ($reuse) {
     print STDERR
         "running setup (this takes 8-12 minutes for RDS provisioning)...\n";
     ($setup_rc, undef, $setup_err) = run_cmd(
-        ['rds/online/.venv/bin/python3', 'rds/online/setup.py',
+        ['rds/online/.venv/bin/python3', '-u', 'rds/online/setup.py',
          $run_id, $pf_path],
         1);
 }

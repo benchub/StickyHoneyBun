@@ -32,7 +32,7 @@ SHB_Assertions::assert_honey_bun_type_exists(
 
 # Self-hosted-only: confirms the log_path GUC was honored at server
 # start. No analog in the RDS variant (config lives in the locked-down
-# sticky_honey_bun_rds_config table, not a GUC).
+# shb_rds_internal.sticky_honey_bun_rds_config table, not a GUC).
 my $log_path_setting = $node->safe_psql('postgres',
     'SHOW sticky_honey_bun.log_path');
 is($log_path_setting, $log_path, 'sticky_honey_bun.log_path GUC honored');

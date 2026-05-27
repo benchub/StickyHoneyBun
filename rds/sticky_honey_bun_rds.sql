@@ -16,7 +16,7 @@
 --   CREATE EXTENSION sticky_honey_bun_rds;
 --   -- Then populate the locked-down config table (PUBLIC has no access;
 --   -- run as the extension owner):
---   INSERT INTO sticky_honey_bun_rds_config(key, value) VALUES
+--   INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) VALUES
 --     ('lambda_arn', 'arn:aws:lambda:REGION:ACCOUNT:function:NAME'),
 --     ('cluster_id', 'my-cluster')   -- optional
 --   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
@@ -73,14 +73,27 @@ $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 -- for an attacker's own queries), and rds_superuser cannot set them
 -- at the database/role level either ("permission denied to set
 -- parameter"). A locked-down table is the tamper-resistant alternative.
-CREATE TABLE sticky_honey_bun_rds_config (
+--
+-- Schema choice: we put the config table in its own schema
+-- (`shb_rds_internal`) rather than `public` so that a common
+-- production misconfig — `GRANT ... ON ALL TABLES IN SCHEMA public TO
+-- some_role` issued AFTER the extension installs — does NOT
+-- silently re-grant access to this table. Operators who don't know
+-- the schema exists can't override its REVOKE through blanket-grant
+-- ergonomic shortcuts. The schema itself is REVOKEd from PUBLIC so
+-- a curious role can't even probe its existence by name.
+CREATE SCHEMA shb_rds_internal;
+REVOKE ALL ON SCHEMA shb_rds_internal FROM PUBLIC;
+
+CREATE TABLE shb_rds_internal.sticky_honey_bun_rds_config (
     key   text PRIMARY KEY,
     value text
 );
-REVOKE ALL ON sticky_honey_bun_rds_config FROM PUBLIC;
-COMMENT ON TABLE sticky_honey_bun_rds_config IS
+REVOKE ALL ON shb_rds_internal.sticky_honey_bun_rds_config FROM PUBLIC;
+COMMENT ON TABLE shb_rds_internal.sticky_honey_bun_rds_config IS
     'Locked-down config for sticky_honey_bun_rds. PUBLIC has no access. '
-    'Modify as the extension owner: INSERT INTO sticky_honey_bun_rds_config '
+    'Modify as the extension owner: INSERT INTO '
+    'shb_rds_internal.sticky_honey_bun_rds_config '
     'VALUES (''lambda_arn'', ''arn:aws:lambda:...''), '
     '(''cluster_id'', ''my-cluster'') '
     'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;';
@@ -117,14 +130,14 @@ BEGIN
     -- locked-down config table so a per-session attacker cannot flip
     -- it the way they could a custom-namespace GUC.
     SELECT value INTO enabled
-      FROM sticky_honey_bun_rds_config
+      FROM shb_rds_internal.sticky_honey_bun_rds_config
      WHERE key = 'enabled';
     IF enabled IN ('off', 'false', '0', 'no') THEN
         RETURN tag;
     END IF;
 
     SELECT value INTO arn
-      FROM sticky_honey_bun_rds_config
+      FROM shb_rds_internal.sticky_honey_bun_rds_config
      WHERE key = 'lambda_arn';
     IF arn IS NULL OR arn = '' THEN
         -- No Lambda configured — return the tag without firing. Lets the
@@ -132,7 +145,7 @@ BEGIN
         RETURN tag;
     END IF;
     SELECT value INTO cluster_id
-      FROM sticky_honey_bun_rds_config
+      FROM shb_rds_internal.sticky_honey_bun_rds_config
      WHERE key = 'cluster_id';
 
     payload := jsonb_build_object(
@@ -210,6 +223,17 @@ SELECT pgtle.create_base_type(
     -1
 );
 
+-- CRITICAL: pg_tle.create_base_type auto-registers a binary-compatible
+-- pg_cast entry between the new type and bytea (the storage type), in
+-- BOTH directions. Binary-compat casts have no function call — PG just
+-- reinterprets the bytes — so `SELECT honey_value::bytea` would
+-- silently read the trap value with ZERO typeoutput dispatch, the
+-- entire trap mechanism bypassed. Drop both directions so any explicit
+-- coercion must go through CoerceViaIO, which DOES invoke
+-- honey_bun_out_rds and fire the trap.
+DROP CAST IF EXISTS (honey_bun AS bytea);
+DROP CAST IF EXISTS (bytea AS honey_bun);
+
 -- USAGE on the type is checked when a column of this type is created or
 -- when a function references it. Closes the indirect-forge path where an
 -- attacker would otherwise CREATE TABLE forge (h honey_bun); INSERT …;
@@ -277,14 +301,30 @@ BEGIN
     -- honey_bun_in_rds / honey_bun_out_rds in public — the heavy
     -- logic (has_type_privilege guard, Lambda invoke) stays in one
     -- place rather than being duplicated per alias.
+    -- The IN wrapper stays SECURITY INVOKER: the canonical
+    -- honey_bun_in_rds does a has_type_privilege check on the
+    -- CALLER, and we need that check to use the actual caller's
+    -- USAGE, not the wrapper-owner's. (If we made this SECURITY
+    -- DEFINER, the wrapper would run as the extension owner, who
+    -- always has USAGE, and the planter-USAGE protection would be
+    -- bypassed for aliases.)
     EXECUTE format(
         'CREATE FUNCTION %I.%I(input text) RETURNS bytea '
      || 'LANGUAGE sql IMMUTABLE STRICT '
      || 'AS ''SELECT public.honey_bun_in_rds(input)''',
         type_schema, in_fn_name);
+    -- The OUT wrapper IS SECURITY DEFINER so a non-EXECUTE-privileged
+    -- caller (e.g. an app role with SELECT on a honey-bearing table)
+    -- can still go through typeoutput dispatch. Without this, app-role
+    -- SELECT on an alias-typed column errors with `permission denied
+    -- for function honey_bun_out_rds`, which (a) breaks the legitimate
+    -- read path and (b) leaks the trap-function name in the error
+    -- message. The canonical honey_bun_out_rds is already SECURITY
+    -- DEFINER so the same logic applies one level out.
     EXECUTE format(
         'CREATE FUNCTION %I.%I(stored bytea) RETURNS text '
-     || 'LANGUAGE sql IMMUTABLE STRICT '
+     || 'LANGUAGE sql IMMUTABLE STRICT SECURITY DEFINER '
+     || 'SET search_path = pg_catalog, public '
      || 'AS ''SELECT public.honey_bun_out_rds(stored)''',
         type_schema, out_fn_name);
 
@@ -304,6 +344,28 @@ BEGIN
 
     new_type := format('%I.%I', type_schema, type_name)::regtype;
     INSERT INTO honey_bun_registry VALUES (new_type);
+    -- Drop the pg_tle-auto-created bytea casts (see the rationale at
+    -- the canonical-type DROP CAST above). pg_tle creates the cast
+    -- under its own pgtle_admin role, so issuing DROP CAST as the
+    -- function caller would error with "must be owner of cast" —
+    -- briefly SET ROLE pgtle_admin (the caller has it; setup.py
+    -- GRANTs pgtle_admin TO CURRENT_USER before install) for the
+    -- duration of the cleanup.
+    BEGIN
+        SET LOCAL ROLE pgtle_admin;
+        EXECUTE format('DROP CAST IF EXISTS (%s AS bytea)', new_type);
+        EXECUTE format('DROP CAST IF EXISTS (bytea AS %s)', new_type);
+    EXCEPTION WHEN insufficient_privilege THEN
+        -- Caller isn't a member of pgtle_admin (only happens if an
+        -- operator manually granted EXECUTE on this function to a
+        -- non-admin role). The bytea-cast bypass is left in place
+        -- under that misconfiguration; document and move on.
+        RAISE WARNING 'create_honey_bun_alias: could not drop bytea casts '
+                      'for % (caller is not a pgtle_admin member); '
+                      'value::bytea will silently bypass the trap for '
+                      'this alias', new_type;
+    END;
+
     -- Mirror the canonical type's USAGE lockdown so an alias doesn't
     -- reopen the indirect-forge path, and REVOKE EXECUTE on the
     -- per-alias delegates so they're not a back door around the I/O

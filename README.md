@@ -2,9 +2,9 @@
 
 ![Sticky Honey Bun](yum.png)
 
-Sticky Honey Bun is a PostgreSQL extension that gives you honeytokens in the form of a custom data type. Simply add a `honey_bun` column to any table(s) you want (the type can be renamed), put a non-null value into this column for any row(s) that you will never select, and 💥! You now have a trap for an attacker who comes in and does an unwary `SELECT * FROM table`.
+Sticky Honey Bun is a PostgreSQL extension that gives you honey tokens in the form of a custom data type. Simply add a new column to any table(s) you want, put a non-null value into said column for any row(s) that you will never select, and 💥! You now have a trap for an attacker who comes in and does an unwary `SELECT * FROM table`.
 
-Sticky Honey Bun alerts are simple - they just log information about who, what, where, when, etc. It is up to the alert processor to decide if the alert is legit and what action should be taken. Actions can be as simple as sending an email or as complicated as revoking the user access or locking everything down. Regardless, that processor lives outside of the DB, and is yours to craft as you desire.
+Sticky Honey Bun alerts are simple - they just log information about who, what, where, when, etc. It is up to the alert processor to decide if the alert is legit and what action should be taken. Actions can be as simple as sending an email or as complicated as revoking the user access or locking everything down. Regardless, that alert processor lives outside of the DB, and is yours to craft as you desire.
 
 ## Quick example
 
@@ -120,7 +120,7 @@ One JSON object per line (file) or per event (Lambda):
 | `pid` | backend PID | Dedup, correlation with PG's own log |
 | `client_addr` | `MyProcPort->raddr` | Primary alert processor filter key (paired with `session_user`) |
 | `query` | `debug_query_string` | Forensics; can be NULL in some internal call paths |
-| `cluster_id` | RDS variant only, set via the `sticky_honey_bun_rds_config` table (key `cluster_id`) | Identifies the source cluster when one Lambda fans many in |
+| `cluster_id` | RDS variant only, set via the `shb_rds_internal.sticky_honey_bun_rds_config` table (key `cluster_id`) | Identifies the source cluster when one Lambda fans many in |
 | `server_addr` | the local address PG was connected to (`MyProcPort->laddr` on self-hosted, `inet_server_addr()` on RDS) | Identifies which node within a cluster fired — primary vs each replica/standby. Always populated, independent of operator-set `cluster_id`. For unix-socket connections (typical in local/test deployments) carries `local:<socket-path>` so two PG instances on the same host stay distinguishable; for TCP connections, the listening IP |
 
 Heartbeat lines carry only `ts`, `event` (always `"heartbeat"`), `tag`
@@ -162,10 +162,10 @@ SELECT * FROM honey_bun_columns;
 SELECT * FROM customers WHERE honey IS NULL;
 
 -- triggers an alert
-SELECT * FROM customers WHERE honey is not null;
+SELECT * FROM customers WHERE honey IS NOT NULL;
 ```
 
-The honeytoken value is opaque to the extension — it's emitted verbatim
+The honey token value is opaque to the extension — it is emitted verbatim
 into the alert log's `tag` field. The recommended convention is
 `schema.table.column`, which gives the alert processor and any audit
 tooling a predictable shape to parse. Use whatever convention suits
@@ -192,8 +192,7 @@ INSERT INTO customers (id, email, auth_token)
   VALUES (-1, 'do-not-touch@internal', 'public.customers.auth_token');
 ```
 
-`create_honey_bun_alias` exists in **both the self-hosted and RDS variants**
-with the same SQL surface. The mechanisms differ:
+While `create_honey_bun_alias` exists in both the self-hosted and RDS variants, the mechanisms differ:
 
 - **Self-hosted (C)**: each alias gets its own SQL-level I/O functions
   bound to the same compiled C symbols, plus a full set of comparison
@@ -204,7 +203,7 @@ with the same SQL surface. The mechanisms differ:
   A `honey_bun_registry` table tracks which types are honey-shaped so the
   `honey_bun_columns` view can find them.
 
-Aliases trap identically to `honey_bun` and appear in `honey_bun_columns`.
+Aliases trap identically to `honey_bun` and appear in the `honey_bun_columns` inventory view.
 On self-hosted, aliases depend on the extension's C functions; `DROP EXTENSION
 sticky_honey_bun CASCADE` removes them along with everything else.
 
@@ -246,11 +245,9 @@ shape, so a single alert processor (a reference exists in `tools/alert_monitor.p
 ### Installing on RDS / Aurora
 
 Prerequisites on the cluster:
-- `pg_tle` extension (whitelist via `rds.allowed_extensions` /
-  `aurora.allowed_extensions` parameter group, then `CREATE EXTENSION pg_tle`).
-- `aws_lambda` extension.
-- IAM role on the RDS instance with `lambda:InvokeFunction` on the target
-  Lambda (deploy `lambda/handler.py`).
+* `pg_tle` extension (whitelist via `rds.allowed_extensions` /  `aurora.allowed_extensions` parameter group,  then `CREATE EXTENSION pg_tle`).
+* `aws_lambda` extension.
+* IAM role on the RDS instance with `lambda:InvokeFunction` on the target Lambda (deploy `lambda/handler.py`).
 
 ```sh
 psql ... -f rds/sticky_honey_bun_rds.sql
@@ -259,7 +256,7 @@ psql ... -c "CREATE EXTENSION sticky_honey_bun_rds"
 # Configure the Lambda ARN (and optional cluster_id) in the locked-down
 # config table. Run as the extension owner — PUBLIC has no access.
 psql ... <<SQL
-INSERT INTO sticky_honey_bun_rds_config(key, value) VALUES
+INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) VALUES
   ('lambda_arn', 'arn:aws:lambda:us-east-1:123456789012:function:my-shb'),
   ('cluster_id', 'prod-us-east-1')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
@@ -298,11 +295,11 @@ restart, which is auditable infrastructure activity rather than a quiet
 stores its configuration in a locked-down table:
 
 ```sql
-CREATE TABLE sticky_honey_bun_rds_config (
+CREATE TABLE shb_rds_internal.sticky_honey_bun_rds_config (
     key   text PRIMARY KEY,
     value text
 );
-REVOKE ALL ON sticky_honey_bun_rds_config FROM PUBLIC;
+REVOKE ALL ON shb_rds_internal.sticky_honey_bun_rds_config FROM PUBLIC;
 ```
 
 | Key | Description |
@@ -382,8 +379,7 @@ variant (`self-hosted/` and `rds/`) and shared assertion bodies in
 which are intentionally skipped), and the guidance for adding new
 tests all live in **[`t/variants/README.md`](t/variants/README.md)**.
 
-Self-hosted suite (uses `PostgreSQL::Test::Cluster`, runs in docker
-because the Perl module isn't on Homebrew):
+Self-hosted suite (uses `PostgreSQL::Test::Cluster`, runs in docker):
 
 ```sh
 make docker-test-15        # run TAP suite against PG 15
@@ -723,6 +719,147 @@ weekly fallback.
   with `pg_read_all_data` (which `rds_superuser` has) can inspect them. This
   is a hard limitation of running in managed Postgres; for tamper resistance
   use the self-hosted variant.
+
+## Known bypass paths
+
+These are paths a SQL-level attacker can take to read honey-bearing
+rows or read-around the trap without firing it. They follow directly
+from how PostgreSQL's executor and type system work, and from what
+Sticky Honey Bun explicitly *isn't* trying to do (see "Not goals").
+They're documented here so an operator can reason about the trap's
+real coverage when designing their detection pipeline.
+
+### The trap is column-projection-scoped
+
+The C / pg_tle output functions fire only when the honey value is
+**projected to the client**. Any query that touches a honey-bearing
+row but never asks PG to materialize the honey column is silent. In
+practice this means:
+
+- **Column avoidance**: `SELECT id, email FROM customers` (omitting
+  the honey column) reads every non-honey field with zero alerts.
+- **WHERE-only access**: `SELECT id FROM customers WHERE id != 5` /
+  `LIMIT 4` / CTE/subquery wrappings that project the honey column
+  away silently extract every other column. PG applies the WHERE
+  quals against raw heap tuples before any output function dispatch.
+- **`RETURNING` clauses with honey omitted**:
+  `DELETE FROM customers WHERE id = 5 RETURNING id, email, full_name`
+  destroys the row, returns its non-honey columns, and never fires
+  the trap. Worst case in this category: silent exfil paired with a
+  destructive write. The attacker needs DML.
+- **`INSERT INTO target SELECT FROM honey_table`**: copies honey
+  values from one column to another without ever projecting them to
+  a client. The source row's typeoutput is not invoked when the
+  destination column is the same type.
+- **`EXPLAIN ANALYZE`**: PG's EXPLAIN DestReceiver discards tuples
+  without invoking attribute output functions. So `EXPLAIN ANALYZE
+  SELECT * FROM customers` scans honey rows but never fires. It also
+  exposes row counts and (after autovacuum) planner row estimates
+  via `Plan Rows:` / `Rows Removed by Filter:` — a near-perfect
+  silent probe.
+
+This is by design: the trap protects column *reads*, not column
+*touches*. Closing it would require hooking the executor's per-attribute
+dispatch, which an extension cannot do cleanly. **Operators who care
+about projection-bypass paths should pair the trap with alert
+processor's filtering of writes against honey tables in PG's own
+csvlog / pgaudit stream.** The trap detects who *reads* the honey;
+the audit log catches who *touches* the row.
+
+### `pg_basebackup` / REPLICATION privilege is SELECT-on-everything without alerts
+
+A role with `REPLICATION` privilege can run `pg_basebackup` and ship
+the raw heap to a target directory, bypassing the type system
+entirely (`strings base/.../<oid>` recovers honey tag values). The
+trap never fires because walsender uses neither `typoutput` nor
+`typsend`. README's "Not goals" already excludes OS-level data
+theft; REPLICATION is the SQL-level equivalent of that, so it lives
+here as the same class of concern. **The defense is at the role-
+grants layer: `REPLICATION` is a high-privilege grant; track it
+separately and revoke it from any role that doesn't need replication
+specifically.**
+
+### Comparison / sort operators on self-hosted bypass typeoutput (RDS does not)
+
+The self-hosted C variant ships `=` / `<` / `cmp` / `hash` / `MIN` /
+`MAX` operators bound to PG's built-in `byteaeq` / `byteacmp` /
+`hashvarlena` — so `ORDER BY honey`, `MAX(honey)`, `DISTINCT honey`,
+and joins on honey columns all work ergonomically. They also all
+**bypass the trap** when the honey value isn't projected:
+`SELECT id FROM customers ORDER BY last_token DESC LIMIT 1` leaks
+the ID of the highest-honey-value row with zero alerts. The RDS
+pg_tle variant is strictly stronger here — it doesn't auto-generate
+operators, so these queries error out instead. The self-hosted
+variant trades ergonomics for silent comparison primitives;
+operators who want the RDS-style safety can drop the operators
+manually post-install. Closing this in-code would require binding
+the operators to wrappers that invoke the trap before delegating —
+which fires alerts on every comparison and is noisy.
+
+### Catalog reconstruction defeats `honey_bun_columns` lockdown
+
+The `REVOKE ALL ON honey_bun_columns FROM PUBLIC` is operator-
+convenience, not a confidentiality boundary. PostgreSQL's `pg_type`,
+`pg_proc`, `pg_attribute`, and (for RDS) `pg_proc.prosrc` are
+world-readable by default. An attacker who knows the trap function
+name can join those catalogs to reconstruct the full
+`(schema, table, column)` map without firing the trap. Self-hosted
+aliases all share the same C symbol in `pg_proc.prosrc`
+(`honey_bun_out`); RDS aliases each show their per-alias wrapper
+whose body contains `honey_bun_out_rds`. Either is a one-query
+reconstruction. **Do not rely on the inventory view for opacity;
+do rely on it for ergonomics and for keeping casual users from
+stumbling onto trap locations.** If you need confidentiality of trap
+locations against a determined SQL-level attacker, deploy aliases
+liberally and let the catalog enumeration cost more queries.
+
+### `pg_stats` is a quiet side-channel
+
+Even with `pg_statistic` not directly readable as the planner's
+table, `pg_stats` (the publicly-readable view over it) exposes
+`avg_width`, `null_frac`, and (via `pg_stat_user_indexes`) the names
+of partial indexes the operator may have created on honey columns.
+An attacker reading `pg_stats` can infer:
+- The approximate length of honey tags (`avg_width`).
+- The exact count of honey-bearing rows (`null_frac × reltuples`).
+- The name of a `WHERE honey IS NOT NULL` partial index, which often
+  hints at the column name.
+- The `last_analyze` timestamp.
+
+All read with zero alerts. With two or more distinct honey values,
+`pg_statistic.stavaluesN` *would* hold the tag values; reading them
+through `pg_stats`' `anyarray::text` cast WOULD fire the trap, but
+the value is also returned to the attacker before the alert lands —
+the detection-vs-leak race favors whoever reads the result first.
+**Operators who care about this can `REVOKE SELECT ON pg_statistic
+FROM PUBLIC` (PG-version-dependent) or rotate honey columns'
+ANALYZE settings.**
+
+### RDS error message names the trap function
+
+On RDS, an unprivileged role that runs `SELECT * FROM honey_table`
+gets `ERROR: permission denied for function honey_bun_out_rds`
+because pg_tle's wrapper architecture consults function ACLs (PG's
+native typeoutput dispatch does not). The error message names the
+trap. An attacker iterating column-by-column can map every honey
+column with zero alerts AND zero forgery. The self-hosted C variant
+does not have this surface — its typeoutput dispatch bypasses ACLs
+and fires the trap normally. We don't fix this on RDS because the
+alternative (`GRANT EXECUTE` on `honey_bun_out_rds` to PUBLIC)
+re-opens the alert-forge primitive, where an attacker calls the
+function directly with an arbitrary tag. **Operators who care about
+this trade-off on RDS can deploy a self-hosted standby that mirrors
+the same tables; that path fires normally.**
+
+### Blanket grants on the public schema can re-expose the RDS config table
+
+If an operator issues `GRANT ALL ON ALL TABLES IN SCHEMA public TO
+some_role` *after* installing the RDS extension, that grant overrides
+the extension's `REVOKE`. Sticky Honey Bun installs the config table
+in a dedicated `shb_rds_internal` schema (also REVOKEd from PUBLIC)
+specifically to avoid this trap. **Do not move the config table back
+to `public`; do not grant access to `shb_rds_internal` to any role
+that doesn't need to administer the trap.**
 
 ## License
 

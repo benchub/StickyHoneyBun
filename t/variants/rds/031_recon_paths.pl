@@ -10,7 +10,7 @@
 #
 # Closed paths (assertion: denied):
 #   - honey_bun_columns view (REVOKEd from PUBLIC)
-#   - sticky_honey_bun_rds_config table (REVOKEd from PUBLIC)
+#   - shb_rds_internal.sticky_honey_bun_rds_config table (REVOKEd from PUBLIC)
 #
 # Open recon paths (assertion: readable — acknowledged limitation):
 #   - pg_type lists `honey_bun` by name
@@ -46,13 +46,13 @@ SHB_Assertions::assert_inventory_locked_from_role(
     $as_app,
     'recon: honey_bun_columns denied to app role');
 
-# CLOSED: sticky_honey_bun_rds_config table (the config holding
+# CLOSED: shb_rds_internal.sticky_honey_bun_rds_config table (the config holding
 # lambda_arn). PUBLIC has no access; an attacker session cannot read
 # the Lambda ARN this way.
 {
     my ($rc, undef, $stderr) = $as_app->(
-        'SELECT key, value FROM sticky_honey_bun_rds_config');
-    isnt($rc, 0, 'recon: sticky_honey_bun_rds_config SELECT denied to app');
+        'SELECT key, value FROM shb_rds_internal.sticky_honey_bun_rds_config');
+    isnt($rc, 0, 'recon: shb_rds_internal.sticky_honey_bun_rds_config SELECT denied to app');
     like($stderr, qr/permission denied/i,
         'recon: config table denial is a permission-denied error');
 }

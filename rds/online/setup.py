@@ -481,22 +481,24 @@ def psql_stdin(connstr, sql_text):
 def populate_config(connstr, lambda_arn, cluster_id=None):
     """Write the locked-down config the trap function reads.
 
-    After install_extension_stack creates the empty sticky_honey_bun_rds_config
-    table, the operator (or this setup script) must INSERT the lambda_arn
-    and optionally a cluster_id. UPSERT semantics so re-runs against the
-    same RDS instance work cleanly."""
+    The config table lives in `shb_rds_internal` (NOT public) so that
+    blanket `GRANT ... ON ALL TABLES IN SCHEMA public` issued by an
+    operator after install does not silently re-grant access to the
+    table. The operator (or this setup script) must INSERT the
+    lambda_arn and optionally a cluster_id. UPSERT semantics so re-runs
+    against the same RDS instance work cleanly."""
     # Single-quote escape: passwords/identifiers we generate are alphanumeric,
     # but lambda ARNs and cluster_ids are operator-supplied — be defensive.
     lambda_arn_esc = lambda_arn.replace("'", "''")
     psql(connstr,
-         f"INSERT INTO sticky_honey_bun_rds_config (key, value) VALUES "
-         f"('lambda_arn', '{lambda_arn_esc}') "
+         f"INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config (key, value) "
+         f"VALUES ('lambda_arn', '{lambda_arn_esc}') "
          f"ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
     if cluster_id:
         cluster_id_esc = cluster_id.replace("'", "''")
         psql(connstr,
-             f"INSERT INTO sticky_honey_bun_rds_config (key, value) VALUES "
-             f"('cluster_id', '{cluster_id_esc}') "
+             f"INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config (key, value) "
+             f"VALUES ('cluster_id', '{cluster_id_esc}') "
              f"ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
 
 

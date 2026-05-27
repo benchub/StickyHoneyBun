@@ -21,7 +21,7 @@ sticky_honey_bun.heartbeat_interval_seconds = 0
 });
 $node->start;
 
-$node->safe_psql('postgres', 'CREATE EXTENSION sticky_honey_bun');
+SHB::install_extension($node);
 
 # Cross-variant assertion wrappers:
 #   $run_psql:  $node->psql returns ($rc, $stdout, $stderr) — direct fit.

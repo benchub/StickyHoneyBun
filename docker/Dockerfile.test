@@ -12,6 +12,16 @@ ARG EXTRA_CFLAGS=""
 ENV PG_CPPFLAGS="${EXTRA_CFLAGS}"
 ENV COPT="${EXTRA_CFLAGS}"
 
+# Which schema the tests install the extension into. Empty = default
+# install (PG drops it in current_schema(), typically `public`).
+# Any other value triggers the relocatable-install path via the
+# SHB::install_extension helper (CREATE SCHEMA, CREATE EXTENSION WITH
+# SCHEMA, ALTER DATABASE search_path). `make docker-test-matrix` runs
+# the suite once per (PG version × {public, sticky_honey_bun}) pair so
+# a regression that breaks either install layout is caught.
+ARG SHB_INSTALL_SCHEMA=""
+ENV SHB_INSTALL_SCHEMA="${SHB_INSTALL_SCHEMA}"
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         build-essential \

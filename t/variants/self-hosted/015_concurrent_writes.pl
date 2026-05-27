@@ -38,8 +38,8 @@ $node->start;
 
 # 50 distinct trap tags. Each child cycles through them; the total
 # count should equal $EXPECTED regardless of which tag each trip used.
+SHB::install_extension($node);
 $node->safe_psql('postgres', q{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
     INSERT INTO t
       SELECT g, 'public.t.tag_' || g

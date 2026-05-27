@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 # Variants: rds
 # Asserts: the owner-controlled `enabled` row in the locked-down
-#          shb_rds_internal.sticky_honey_bun_rds_config table is a working kill switch.
+#          sticky_honey_bun.config table is a working kill switch.
 #          Setting it to 'off' silences the trap; removing the row
 #          (or setting it to any non-disable value) resumes alerting.
 #          This is the RDS analog of the self-hosted PGC_POSTMASTER
@@ -27,17 +27,17 @@ my $cs_config = SHB_RDS::connstr($st);   # plain postgres-db connection for conf
 
 # Snapshot the prior `enabled` value (if any) and restore it on exit.
 my (undef, $saved_enabled) = SHB_RDS::psql_run($cs_config,
-    "SELECT coalesce(value, '__missing__') FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'enabled' "
+    "SELECT coalesce(value, '__missing__') FROM sticky_honey_bun.config WHERE key = 'enabled' "
   . "UNION ALL SELECT '__missing__' LIMIT 1");
 chomp $saved_enabled;
 
 END {
     if ($saved_enabled eq '__missing__') {
         SHB_RDS::psql_run($cs_config,
-            "DELETE FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'enabled'");
+            "DELETE FROM sticky_honey_bun.config WHERE key = 'enabled'");
     } else {
         SHB_RDS::psql_run($cs_config,
-            "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) "
+            "INSERT INTO sticky_honey_bun.config(key, value) "
           . "VALUES ('enabled', '$saved_enabled') "
           . "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
     }
@@ -57,7 +57,7 @@ SHB_RDS::psql_run($cs, 'CREATE TABLE t (id int, honey honey_bun)');
 # Flip the kill switch: set `enabled` to 'off'.
 {
     my ($rc) = SHB_RDS::psql_run($cs_config,
-        "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) VALUES ('enabled', 'off') "
+        "INSERT INTO sticky_honey_bun.config(key, value) VALUES ('enabled', 'off') "
       . "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
     is($rc, 0, 'kill switch flipped: UPDATE enabled=off');
 }
@@ -81,7 +81,7 @@ SHB_RDS::psql_run($cs, 'CREATE TABLE t (id int, honey honey_bun)');
 # Flip back: set `enabled` to 'on' (or any non-disable value).
 {
     my ($rc) = SHB_RDS::psql_run($cs_config,
-        "UPDATE shb_rds_internal.sticky_honey_bun_rds_config SET value = 'on' WHERE key = 'enabled'");
+        "UPDATE sticky_honey_bun.config SET value = 'on' WHERE key = 'enabled'");
     is($rc, 0, 'kill switch restored: UPDATE enabled=on');
 
     my $resume_tag = SHB_RDS::unique_tag($st, 'killswitch_resumed');
@@ -97,7 +97,7 @@ SHB_RDS::psql_run($cs, 'CREATE TABLE t (id int, honey honey_bun)');
         user     => 'shbtest_app',
         password => $st->{app_password});
     my ($rc, undef, $stderr) = SHB_RDS::psql_run($cs_app,
-        "UPDATE shb_rds_internal.sticky_honey_bun_rds_config SET value = 'off' WHERE key = 'enabled'");
+        "UPDATE sticky_honey_bun.config SET value = 'off' WHERE key = 'enabled'");
     isnt($rc, 0,
         'app role cannot flip the enabled switch (config table is REVOKEd)');
     like($stderr, qr/permission denied/i,

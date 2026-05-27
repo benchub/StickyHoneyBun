@@ -20,8 +20,8 @@ sticky_honey_bun.log_path = '$log_path'
 });
 $node->start;
 
+SHB::install_extension($node);
 $node->safe_psql('postgres', q{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE SCHEMA private;
     CREATE TABLE public.customers (id int, honey honey_bun);
     CREATE TABLE public.audit     (id int, honey honey_bun);

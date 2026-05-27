@@ -40,8 +40,8 @@ $subscriber->start;
 
 # Both clusters get the extension and a matching honey-bearing table.
 for my $node ($publisher, $subscriber) {
+    SHB::install_extension($node);
     $node->safe_psql('postgres', q{
-        CREATE EXTENSION sticky_honey_bun;
         CREATE TABLE t (id int PRIMARY KEY, honey honey_bun);
     });
 }

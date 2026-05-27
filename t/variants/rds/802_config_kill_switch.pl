@@ -25,7 +25,7 @@ my $get_event = SHB_RDS::get_event_fn($st);
 # Snapshot the lambda_arn so we can restore it on exit.
 my (undef, $saved_arn) = SHB_RDS::psql_run(
     SHB_RDS::connstr($st, db => 'db_a'),
-    "SELECT value FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'lambda_arn'");
+    "SELECT value FROM sticky_honey_bun.config WHERE key = 'lambda_arn'");
 chomp $saved_arn;
 diag("saved lambda_arn=$saved_arn for restoration");
 
@@ -34,7 +34,7 @@ END {
     if (defined $saved_arn && length $saved_arn) {
         my $restore_cs = SHB_RDS::connstr($st, db => 'db_a');
         SHB_RDS::psql_run($restore_cs,
-            "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) "
+            "INSERT INTO sticky_honey_bun.config(key, value) "
           . "VALUES ('lambda_arn', '$saved_arn') "
           . "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
         diag("restored lambda_arn in db_a");
@@ -56,7 +56,7 @@ SHB_RDS::psql_run($cs, 'CREATE TABLE t (id int, honey honey_bun)');
 {
     my ($rc) = SHB_RDS::psql_run(
         SHB_RDS::connstr($st, db => 'db_a'),
-        "DELETE FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'lambda_arn'");
+        "DELETE FROM sticky_honey_bun.config WHERE key = 'lambda_arn'");
     is($rc, 0, 'kill switch flipped: DELETE lambda_arn');
 }
 
@@ -88,7 +88,7 @@ SHB_RDS::psql_run($cs, 'CREATE TABLE t (id int, honey honey_bun)');
 {
     my ($rc) = SHB_RDS::psql_run(
         SHB_RDS::connstr($st, db => 'db_a'),
-        "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) "
+        "INSERT INTO sticky_honey_bun.config(key, value) "
       . "VALUES ('lambda_arn', '$saved_arn')");
     is($rc, 0, 'kill switch restored: INSERT lambda_arn back');
 

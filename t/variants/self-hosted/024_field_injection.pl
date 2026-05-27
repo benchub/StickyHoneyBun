@@ -53,8 +53,8 @@ my $tag_multi      = $tag_multi_base . qq{\nforged\n{"nested":"json"}};
 
 my $tag_app = 'shb_inject_field_appname.public.t.honey';
 
+SHB::install_extension($node);
 $node->safe_psql('postgres', qq{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
     INSERT INTO t VALUES (1, '$tag_inject');
     INSERT INTO t VALUES (2, E'${tag_multi_base}\\nforged\\n{"nested":"json"}');

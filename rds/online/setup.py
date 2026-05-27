@@ -481,7 +481,7 @@ def psql_stdin(connstr, sql_text):
 def populate_config(connstr, lambda_arn, cluster_id=None):
     """Write the locked-down config the trap function reads.
 
-    The config table lives in `shb_rds_internal` (NOT public) so that
+    The config table lives in `sticky_honey_bun` (NOT public) so that
     blanket `GRANT ... ON ALL TABLES IN SCHEMA public` issued by an
     operator after install does not silently re-grant access to the
     table. The operator (or this setup script) must INSERT the
@@ -491,13 +491,13 @@ def populate_config(connstr, lambda_arn, cluster_id=None):
     # but lambda ARNs and cluster_ids are operator-supplied — be defensive.
     lambda_arn_esc = lambda_arn.replace("'", "''")
     psql(connstr,
-         f"INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config (key, value) "
+         f"INSERT INTO sticky_honey_bun.config (key, value) "
          f"VALUES ('lambda_arn', '{lambda_arn_esc}') "
          f"ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
     if cluster_id:
         cluster_id_esc = cluster_id.replace("'", "''")
         psql(connstr,
-             f"INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config (key, value) "
+             f"INSERT INTO sticky_honey_bun.config (key, value) "
              f"VALUES ('cluster_id', '{cluster_id_esc}') "
              f"ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value")
 

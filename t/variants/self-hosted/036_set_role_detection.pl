@@ -23,8 +23,8 @@ $node->start;
 
 # Set up: master plants the honey row + grants the planter role
 # enough to SELECT. The planter role is the role we'll SET ROLE to.
+SHB::install_extension($node);
 $node->safe_psql('postgres', q{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
     INSERT INTO t VALUES (1, 'public.t.honey.set_role');
     CREATE ROLE planter LOGIN;

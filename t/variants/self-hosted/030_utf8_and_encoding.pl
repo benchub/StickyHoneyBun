@@ -39,8 +39,8 @@ $node->start;
 # Multi-byte UTF-8 in the tag value (Japanese + emoji + Cyrillic + diacritic).
 my $tag_multibyte = '蜂蜜🍯 пчела café';
 
+SHB::install_extension($node);
 $node->safe_psql('postgres', qq{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
     INSERT INTO t VALUES (1, '$tag_multibyte');
 });

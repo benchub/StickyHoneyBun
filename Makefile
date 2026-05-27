@@ -99,8 +99,29 @@ endef
 $(foreach v,$(PG_TEST_VERSIONS),$(eval $(call DOCKER_TEST_TARGET,$(v))))
 
 .PHONY: docker-test-matrix
-docker-test-matrix: $(addprefix docker-test-,$(PG_TEST_VERSIONS))
-	@echo "==> Test matrix complete for: $(PG_TEST_VERSIONS)"
+# Run the self-hosted suite across PG version × install-schema. The
+# install-schema dimension catches regressions where a code change
+# breaks either the default-install layout (objects in `public`) or
+# the hardened layout (objects relocated under WITH SCHEMA). Per-
+# version targets (docker-test-15 etc.) keep the default-public mode
+# so inner-loop development stays cheap; only `docker-test-matrix`
+# pays for the doubled run count.
+docker-test-matrix:
+	@set -e; \
+	for v in $(PG_TEST_VERSIONS); do \
+	    for s in "" sticky_honey_bun; do \
+	        label=$${s:-public}; \
+	        echo "==> Testing PG $$v / install-schema=$$label$(if $(DOCKER_PLATFORM), [$(DOCKER_PLATFORM)],)"; \
+	        docker build \
+	            $(if $(DOCKER_PLATFORM),--platform $(DOCKER_PLATFORM)) \
+	            --build-arg PG_MAJOR=$$v \
+	            --build-arg SHB_INSTALL_SCHEMA=$$s \
+	            --file docker/Dockerfile.test \
+	            --tag sticky-honey-bun-test:pg$$v-$$label \
+	            . ; \
+	    done ; \
+	done
+	@echo "==> Test matrix complete: PG {$(PG_TEST_VERSIONS)} x install-schema {public, sticky_honey_bun}"
 
 # UBSAN build: recompile only the extension with -fsanitize=undefined and
 # run the test suite under it. PG itself stays uninstrumented (apt

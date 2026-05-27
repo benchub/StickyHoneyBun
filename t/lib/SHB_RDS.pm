@@ -75,6 +75,15 @@ sub load_state {
 #   password => $state->{app_password}
 #   db => 'db_a'
 #   search_path => 'shb_t003'  # baked into the URI via options=-csearch_path=...
+#
+# Note on search_path: every returned URI puts `sticky_honey_bun` in
+# the search_path (whether or not the caller asked for a custom
+# search_path). The extension's view + alias function + config table
+# all live there, and the master role's SELECT grants on them require
+# either qualified names or the schema being on search_path. Including
+# it transparently lets tests use unqualified `honey_bun_columns` /
+# `create_honey_bun_alias` like they could when those objects lived in
+# public.
 sub connstr {
     my ($state, %p) = @_;
     my $user = $p{user}     // $state->{master_user};
@@ -83,14 +92,16 @@ sub connstr {
     my $host = $state->{endpoint}{host};
     my $port = $state->{endpoint}{port};
     my $uri = "postgres://$user:$pw\@$host:$port/$db?sslmode=require";
-    if (defined $p{search_path}) {
-        # PG accepts startup options via the `options` URI param. -c sets
-        # a GUC for the connection's lifetime, so it survives separate
-        # psql_run() calls (each of which is a fresh psql process and a
-        # fresh PG session, but all share this connstr).
-        my $sp = $p{search_path};
-        $uri .= "&options=-c%20search_path%3D$sp%2Cpublic";
-    }
+    # Build search_path: caller's schema first (if any), then
+    # sticky_honey_bun (so the extension's view/function/config are
+    # name-resolvable), then public (where the type and I/O functions
+    # live on RDS).
+    my @sp = ();
+    push @sp, $p{search_path} if defined $p{search_path};
+    push @sp, 'sticky_honey_bun', 'public';
+    my $sp = join(',', @sp);
+    # %20 = space, %3D = '=', %2C = ',' in URL encoding.
+    $uri .= "&options=-c%20search_path%3D" . join('%2C', @sp);
     return $uri;
 }
 

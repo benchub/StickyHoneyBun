@@ -37,8 +37,8 @@ $subscriber->init;
 $subscriber->start;
 
 # Publisher has the extension + honey column.
+SHB::install_extension($publisher);
 $publisher->safe_psql('postgres', q{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int PRIMARY KEY, honey honey_bun);
 });
 

@@ -14,9 +14,9 @@
 #   4. SELECT from the honey_bun_columns inventory view.
 #
 # RDS-specific vectors (inline below):
-#   5. SELECT from shb_rds_internal.sticky_honey_bun_rds_config — discovery of the
+#   5. SELECT from sticky_honey_bun.config — discovery of the
 #      Lambda ARN (the alert sink) and the per-cluster cluster_id.
-#   6. UPDATE / DELETE / INSERT on shb_rds_internal.sticky_honey_bun_rds_config —
+#   6. UPDATE / DELETE / INSERT on sticky_honey_bun.config —
 #      tamper attempts (redirect alerts, silence the trap, configure
 #      a forged cluster_id).
 #   7. INSERT enabled='off' specifically — the kill-switch tamper,
@@ -103,9 +103,9 @@ SHB_Assertions::assert_inventory_locked_from_role(
 # the receiver.
 {
     my ($rc, undef, $stderr) = $as_app->(
-        "SELECT value FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'lambda_arn'");
+        "SELECT value FROM sticky_honey_bun.config WHERE key = 'lambda_arn'");
     isnt($rc, 0,
-        'red-team: app cannot SELECT from shb_rds_internal.sticky_honey_bun_rds_config');
+        'red-team: app cannot SELECT from sticky_honey_bun.config');
     like($stderr, qr/permission denied/i,
         'red-team: config table SELECT is permission-denied');
 }
@@ -113,19 +113,19 @@ SHB_Assertions::assert_inventory_locked_from_role(
 # ---- Vector 6: tamper with the config (redirect / silence the trap).
 for my $tamper (
     [ 'UPDATE',
-      "UPDATE shb_rds_internal.sticky_honey_bun_rds_config "
+      "UPDATE sticky_honey_bun.config "
     . "SET value = 'arn:aws:lambda:us-east-1:0:function:hijack' "
     . "WHERE key = 'lambda_arn'" ],
     [ 'DELETE',
-      "DELETE FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'lambda_arn'" ],
+      "DELETE FROM sticky_honey_bun.config WHERE key = 'lambda_arn'" ],
     [ 'INSERT',
-      "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) "
+      "INSERT INTO sticky_honey_bun.config(key, value) "
     . "VALUES ('lambda_arn', 'arn:aws:lambda:us-east-1:0:function:hijack')" ],
 ) {
     my ($verb, $sql) = @$tamper;
     my ($rc, undef, $stderr) = $as_app->($sql);
     isnt($rc, 0,
-        "red-team: app cannot $verb shb_rds_internal.sticky_honey_bun_rds_config");
+        "red-team: app cannot $verb sticky_honey_bun.config");
     like($stderr, qr/permission denied/i,
         "red-team: $verb on config table is permission-denied");
 }
@@ -133,7 +133,7 @@ for my $tamper (
 # ---- Vector 7: flip the kill switch.
 {
     my ($rc, undef, $stderr) = $as_app->(
-        "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) "
+        "INSERT INTO sticky_honey_bun.config(key, value) "
       . "VALUES ('enabled', 'off')");
     isnt($rc, 0,
         'red-team: app cannot flip the `enabled` kill switch '

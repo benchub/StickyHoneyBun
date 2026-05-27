@@ -16,7 +16,7 @@
 --   CREATE EXTENSION sticky_honey_bun_rds;
 --   -- Then populate the locked-down config table (PUBLIC has no access;
 --   -- run as the extension owner):
---   INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) VALUES
+--   INSERT INTO sticky_honey_bun.config(key, value) VALUES
 --     ('lambda_arn', 'arn:aws:lambda:REGION:ACCOUNT:function:NAME'),
 --     ('cluster_id', 'my-cluster')   -- optional
 --   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
@@ -74,26 +74,27 @@ $$ LANGUAGE plpgsql IMMUTABLE STRICT;
 -- at the database/role level either ("permission denied to set
 -- parameter"). A locked-down table is the tamper-resistant alternative.
 --
--- Schema choice: we put the config table in its own schema
--- (`shb_rds_internal`) rather than `public` so that a common
--- production misconfig — `GRANT ... ON ALL TABLES IN SCHEMA public TO
--- some_role` issued AFTER the extension installs — does NOT
--- silently re-grant access to this table. Operators who don't know
--- the schema exists can't override its REVOKE through blanket-grant
--- ergonomic shortcuts. The schema itself is REVOKEd from PUBLIC so
--- a curious role can't even probe its existence by name.
-CREATE SCHEMA shb_rds_internal;
-REVOKE ALL ON SCHEMA shb_rds_internal FROM PUBLIC;
+-- Schema choice: every Sticky Honey Bun internal goes in a dedicated
+-- `sticky_honey_bun` schema (REVOKEd from PUBLIC) rather than `public`,
+-- so a common production misconfig — `GRANT ... ON ALL TABLES IN
+-- SCHEMA public TO some_role` issued AFTER the extension installs —
+-- does NOT silently re-grant access. The schema name is fixed for the
+-- RDS variant (pg_tle TLE install bodies aren't parameterizable);
+-- operators who need a custom name fork the TLE body before install.
+-- The schema mirrors the self-hosted extension's `WITH SCHEMA
+-- sticky_honey_bun` recommended install target, so both variants land
+-- in the same place.
+CREATE SCHEMA sticky_honey_bun;
+REVOKE ALL ON SCHEMA sticky_honey_bun FROM PUBLIC;
 
-CREATE TABLE shb_rds_internal.sticky_honey_bun_rds_config (
+CREATE TABLE sticky_honey_bun.config (
     key   text PRIMARY KEY,
     value text
 );
-REVOKE ALL ON shb_rds_internal.sticky_honey_bun_rds_config FROM PUBLIC;
-COMMENT ON TABLE shb_rds_internal.sticky_honey_bun_rds_config IS
+REVOKE ALL ON sticky_honey_bun.config FROM PUBLIC;
+COMMENT ON TABLE sticky_honey_bun.config IS
     'Locked-down config for sticky_honey_bun_rds. PUBLIC has no access. '
-    'Modify as the extension owner: INSERT INTO '
-    'shb_rds_internal.sticky_honey_bun_rds_config '
+    'Modify as the extension owner: INSERT INTO sticky_honey_bun.config '
     'VALUES (''lambda_arn'', ''arn:aws:lambda:...''), '
     '(''cluster_id'', ''my-cluster'') '
     'ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;';
@@ -130,14 +131,14 @@ BEGIN
     -- locked-down config table so a per-session attacker cannot flip
     -- it the way they could a custom-namespace GUC.
     SELECT value INTO enabled
-      FROM shb_rds_internal.sticky_honey_bun_rds_config
+      FROM sticky_honey_bun.config
      WHERE key = 'enabled';
     IF enabled IN ('off', 'false', '0', 'no') THEN
         RETURN tag;
     END IF;
 
     SELECT value INTO arn
-      FROM shb_rds_internal.sticky_honey_bun_rds_config
+      FROM sticky_honey_bun.config
      WHERE key = 'lambda_arn';
     IF arn IS NULL OR arn = '' THEN
         -- No Lambda configured — return the tag without firing. Lets the
@@ -145,7 +146,7 @@ BEGIN
         RETURN tag;
     END IF;
     SELECT value INTO cluster_id
-      FROM shb_rds_internal.sticky_honey_bun_rds_config
+      FROM sticky_honey_bun.config
      WHERE key = 'cluster_id';
 
     payload := jsonb_build_object(
@@ -244,15 +245,16 @@ REVOKE USAGE ON TYPE honey_bun FROM PUBLIC;
 -- Registry of honey-shaped types created by this extension. pg_tle wraps
 -- typinput/typoutput internally, so we cannot reliably identify aliases by
 -- inspecting pg_proc.prosrc the way the self-hosted C variant does.
-CREATE TABLE honey_bun_registry (type_oid oid PRIMARY KEY);
-INSERT INTO honey_bun_registry VALUES ('honey_bun'::regtype);
+-- Lives in the sticky_honey_bun schema alongside the config table.
+CREATE TABLE sticky_honey_bun.honey_bun_registry (type_oid oid PRIMARY KEY);
+INSERT INTO sticky_honey_bun.honey_bun_registry VALUES ('honey_bun'::regtype);
 
-CREATE VIEW honey_bun_columns AS
+CREATE VIEW sticky_honey_bun.honey_bun_columns AS
     SELECT n.nspname  AS schema_name,
            c.relname  AS table_name,
            a.attname  AS column_name,
            tn.nspname || '.' || t.typname AS type_name
-      FROM honey_bun_registry r
+      FROM sticky_honey_bun.honey_bun_registry r
       JOIN pg_type      t  ON t.oid = r.type_oid
       JOIN pg_attribute a  ON a.atttypid = t.oid
       JOIN pg_class     c  ON a.attrelid = c.oid
@@ -263,20 +265,22 @@ CREATE VIEW honey_bun_columns AS
        AND c.relkind IN ('r', 'p')
      ORDER BY 1, 2, 3;
 
-COMMENT ON VIEW honey_bun_columns IS
+COMMENT ON VIEW sticky_honey_bun.honey_bun_columns IS
     'Inventory of every column declared with a honey_bun-shaped type, '
     'including any aliases created via create_honey_bun_alias.';
 
 -- Locked down by default: the view is a one-stop enumeration of every
 -- planted trap (including aliases). GRANT SELECT to a narrow audit role
--- when needed. Public has no business reading this.
-REVOKE ALL ON honey_bun_columns FROM PUBLIC;
-REVOKE ALL ON honey_bun_registry FROM PUBLIC;
+-- when needed. Public has no business reading this. The schema-level
+-- REVOKE at top of file already denies USAGE on the schema, so these
+-- are belt-and-suspenders.
+REVOKE ALL ON sticky_honey_bun.honey_bun_columns FROM PUBLIC;
+REVOKE ALL ON sticky_honey_bun.honey_bun_registry FROM PUBLIC;
 
 -- Site-specific aliases. Unlike the C variant, pg_tle base types can share
 -- I/O function signatures, so each alias just registers a new type pointing
 -- at the same PL/pgSQL implementations.
-CREATE FUNCTION create_honey_bun_alias(type_name name,
+CREATE FUNCTION sticky_honey_bun.create_honey_bun_alias(type_name name,
                                        type_schema name DEFAULT current_schema())
 RETURNS regtype
 LANGUAGE plpgsql
@@ -343,7 +347,7 @@ BEGIN
         -1);
 
     new_type := format('%I.%I', type_schema, type_name)::regtype;
-    INSERT INTO honey_bun_registry VALUES (new_type);
+    INSERT INTO sticky_honey_bun.honey_bun_registry VALUES (new_type);
     -- Drop the pg_tle-auto-created bytea casts (see the rationale at
     -- the canonical-type DROP CAST above). pg_tle creates the cast
     -- under its own pgtle_admin role, so issuing DROP CAST as the
@@ -379,9 +383,10 @@ BEGIN
 END;
 $$;
 
-REVOKE EXECUTE ON FUNCTION create_honey_bun_alias(name, name) FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION sticky_honey_bun.create_honey_bun_alias(name, name)
+    FROM PUBLIC;
 
-COMMENT ON FUNCTION create_honey_bun_alias(name, name) IS
+COMMENT ON FUNCTION sticky_honey_bun.create_honey_bun_alias(name, name) IS
     'Register a new honey-shaped type under a site-specific name. Reads of '
     'columns of this type fire the same Lambda invocation as honey_bun.';
 

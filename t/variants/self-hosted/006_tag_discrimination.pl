@@ -15,8 +15,8 @@ sticky_honey_bun.heartbeat_interval_seconds = 0
 });
 $node->start;
 
+SHB::install_extension($node);
 $node->safe_psql('postgres', q{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE customers (id int, honey honey_bun);
     CREATE TABLE audit     (id int, honey honey_bun);
     INSERT INTO customers VALUES (1, 'public.customers.honey');

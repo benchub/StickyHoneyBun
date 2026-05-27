@@ -31,13 +31,13 @@ my $run = sub { SHB_RDS::psql_run($cs, $_[0]) };
 # Capture the legitimate lambda_arn for restoration.
 my (undef, $saved_arn) = SHB_RDS::psql_run(
     SHB_RDS::connstr($st, db => 'db_b'),
-    "SELECT value FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'lambda_arn'");
+    "SELECT value FROM sticky_honey_bun.config WHERE key = 'lambda_arn'");
 chomp $saved_arn;
 
 END {
     if (defined $saved_arn && length $saved_arn) {
         SHB_RDS::psql_run(SHB_RDS::connstr($st, db => 'db_b'),
-            "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) "
+            "INSERT INTO sticky_honey_bun.config(key, value) "
           . "VALUES ('lambda_arn', '$saved_arn') "
           . "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value");
     }
@@ -48,7 +48,7 @@ END {
 # must swallow it.
 my $bogus_arn = 'arn:aws:lambda:us-east-1:000000000000:function:shb-nonexistent';
 SHB_RDS::psql_run(SHB_RDS::connstr($st, db => 'db_b'),
-    "UPDATE shb_rds_internal.sticky_honey_bun_rds_config "
+    "UPDATE sticky_honey_bun.config "
   . "SET value = '$bogus_arn' WHERE key = 'lambda_arn'");
 
 $run->('CREATE TABLE t (id int, honey honey_bun)');

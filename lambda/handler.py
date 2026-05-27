@@ -27,7 +27,7 @@ alert processor handles both sources.
   client_addr      Client IP address, or "local" for unix-socket sessions.
   query            The top-level SQL text (current_query()), or NULL.
   cluster_id       Identifier of the source cluster. Read from the
-                   locked-down sticky_honey_bun_rds_config table (key
+                   locked-down sticky_honey_bun.config table (key
                    'cluster_id'); falls back to inet_server_addr() then
                    "unknown".
 

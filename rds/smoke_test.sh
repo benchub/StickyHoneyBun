@@ -39,7 +39,7 @@ echo "==> Configuring Lambda ARN in the locked-down config table"
 # on the connecting role being the extension owner (or having explicit
 # INSERT/UPDATE grants).
 $PSQL <<SQL
-INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value)
+INSERT INTO sticky_honey_bun.config(key, value)
 VALUES ('lambda_arn', '${STICKY_HONEY_BUN_LAMBDA_ARN}')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
 SQL

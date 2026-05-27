@@ -27,8 +27,8 @@ sticky_honey_bun.terminate_on_read = on
 });
 $node->start;
 
+SHB::install_extension($node);
 $node->safe_psql('postgres', q{
-    CREATE EXTENSION sticky_honey_bun;
     CREATE TABLE t (id int, honey honey_bun);
     INSERT INTO t VALUES (1, 'public.t.honey');
 });

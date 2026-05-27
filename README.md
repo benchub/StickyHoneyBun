@@ -120,7 +120,7 @@ One JSON object per line (file) or per event (Lambda):
 | `pid` | backend PID | Dedup, correlation with PG's own log |
 | `client_addr` | `MyProcPort->raddr` | Primary alert processor filter key (paired with `session_user`) |
 | `query` | `debug_query_string` | Forensics; can be NULL in some internal call paths |
-| `cluster_id` | RDS variant only, set via the `shb_rds_internal.sticky_honey_bun_rds_config` table (key `cluster_id`) | Identifies the source cluster when one Lambda fans many in |
+| `cluster_id` | RDS variant only, set via the `sticky_honey_bun.config` table (key `cluster_id`) | Identifies the source cluster when one Lambda fans many in |
 | `server_addr` | the local address PG was connected to (`MyProcPort->laddr` on self-hosted, `inet_server_addr()` on RDS) | Identifies which node within a cluster fired — primary vs each replica/standby. Always populated, independent of operator-set `cluster_id`. For unix-socket connections (typical in local/test deployments) carries `local:<socket-path>` so two PG instances on the same host stay distinguishable; for TCP connections, the listening IP |
 
 Heartbeat lines carry only `ts`, `event` (always `"heartbeat"`), `tag`
@@ -256,7 +256,7 @@ psql ... -c "CREATE EXTENSION sticky_honey_bun_rds"
 # Configure the Lambda ARN (and optional cluster_id) in the locked-down
 # config table. Run as the extension owner — PUBLIC has no access.
 psql ... <<SQL
-INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) VALUES
+INSERT INTO sticky_honey_bun.config(key, value) VALUES
   ('lambda_arn', 'arn:aws:lambda:us-east-1:123456789012:function:my-shb'),
   ('cluster_id', 'prod-us-east-1')
 ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
@@ -289,17 +289,48 @@ All four GUCs are deliberately `PGC_POSTMASTER`: they can only be set in
 restart, which is auditable infrastructure activity rather than a quiet
 `ALTER SYSTEM` call.
 
+### Schema layout
+
+Sticky Honey Bun ships its non-type internals in a dedicated
+`sticky_honey_bun` schema (REVOKEd from PUBLIC) so that a common
+production misconfig — `GRANT ... ON ALL TABLES IN SCHEMA public TO
+some_role` after install — does NOT silently re-grant access to the
+extension's inventory view, alias function, or config:
+
+| Object | Self-hosted | RDS |
+|---|---|---|
+| `honey_bun` type | `<install_schema>` | `public` (pg_tle constraint) |
+| `honey_bun_in` / `_out` / `_recv` / `_send` (or `_in_rds` / `_out_rds`) | `<install_schema>` | `public` (pg_tle constraint) |
+| operators / op classes / aggregates | `<install_schema>` | (not provided) |
+| `honey_bun_columns` view | `<install_schema>` | `sticky_honey_bun` |
+| `create_honey_bun_alias` function | `<install_schema>` | `sticky_honey_bun` |
+| `honey_bun_registry` table | (not used) | `sticky_honey_bun` |
+| `config` table | (uses GUCs) | `sticky_honey_bun` |
+
+**Self-hosted is relocatable**: `<install_schema>` is whatever you
+pass to `CREATE EXTENSION sticky_honey_bun WITH SCHEMA <name>`,
+defaulting to your current `search_path`. For production-hardened
+installs, use `WITH SCHEMA sticky_honey_bun` (you'll need to
+`CREATE SCHEMA sticky_honey_bun` first) or pick any custom name —
+useful for masking the trap.
+
+**RDS hardcodes `sticky_honey_bun`** because pg_tle TLE install
+bodies aren't parameterizable. Operators who want a different schema
+name fork the TLE body (`rds/sticky_honey_bun_rds.sql`) and reinstall
+under a new TLE name.
+
 ### Configuration (RDS variant)
 
-`pg_tle` in RDS does not allow custom-namespace GUCs to be set durably. The RDS variant therefore
-stores its configuration in a locked-down table:
+`pg_tle` in RDS does not allow custom-namespace GUCs to be set
+durably. The RDS variant therefore stores its configuration in a
+locked-down table inside the `sticky_honey_bun` schema:
 
 ```sql
-CREATE TABLE shb_rds_internal.sticky_honey_bun_rds_config (
+CREATE TABLE sticky_honey_bun.config (
     key   text PRIMARY KEY,
     value text
 );
-REVOKE ALL ON shb_rds_internal.sticky_honey_bun_rds_config FROM PUBLIC;
+REVOKE ALL ON sticky_honey_bun.config FROM PUBLIC;
 ```
 
 | Key | Description |
@@ -316,12 +347,7 @@ redirect alerts by overwriting it, and cannot flip the `enabled` switch.
 Configuration changes go through the extension owner.
 
 The `enabled` switch is the locked-down-table analog of the self-hosted
-`sticky_honey_bun.enabled` GUC. An earlier version of the RDS variant
-deliberately omitted a kill switch because custom-namespace GUCs would
-have been per-session-settable by attackers — but the config table
-closes that escape: only the extension owner can flip `enabled`, and
-the trap reads it via SECURITY DEFINER regardless of caller. To disable
-the trap an operator can either flip `enabled` (cheap, reversible) or
+`sticky_honey_bun.enabled` GUC. To disable the trap an operator can either flip `enabled` (cheap, reversible) or 
 `DROP EXTENSION sticky_honey_bun_rds` (more auditable infrastructure
 activity).
 
@@ -856,9 +882,9 @@ the same tables; that path fires normally.**
 If an operator issues `GRANT ALL ON ALL TABLES IN SCHEMA public TO
 some_role` *after* installing the RDS extension, that grant overrides
 the extension's `REVOKE`. Sticky Honey Bun installs the config table
-in a dedicated `shb_rds_internal` schema (also REVOKEd from PUBLIC)
+in a dedicated `sticky_honey_bun` schema (also REVOKEd from PUBLIC)
 specifically to avoid this trap. **Do not move the config table back
-to `public`; do not grant access to `shb_rds_internal` to any role
+to `public`; do not grant access to `sticky_honey_bun` to any role
 that doesn't need to administer the trap.**
 
 ## License

@@ -1,6 +1,6 @@
 #!/usr/bin/perl
 # Variants: rds
-# Asserts: the shb_rds_internal.sticky_honey_bun_rds_config table is tamper-resistant
+# Asserts: the sticky_honey_bun.config table is tamper-resistant
 #          from app-level sessions. The trap function reads it via
 #          SECURITY DEFINER (as the extension owner), so the trap
 #          path continues to work even though PUBLIC has no access
@@ -30,8 +30,8 @@ my $as_app = sub { SHB_RDS::psql_run($cs_app, $_[0]) };
 # App role cannot SELECT — can't even discover the Lambda ARN.
 {
     my ($rc, undef, $stderr) = $as_app->(
-        'SELECT value FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = \'lambda_arn\'');
-    isnt($rc, 0, 'app cannot SELECT from shb_rds_internal.sticky_honey_bun_rds_config');
+        'SELECT value FROM sticky_honey_bun.config WHERE key = \'lambda_arn\'');
+    isnt($rc, 0, 'app cannot SELECT from sticky_honey_bun.config');
     like($stderr, qr/permission denied/i,
         'SELECT denied with permission-denied error');
 }
@@ -40,10 +40,10 @@ my $as_app = sub { SHB_RDS::psql_run($cs_app, $_[0]) };
 # or silence them via empty string.
 {
     my ($rc, undef, $stderr) = $as_app->(
-        "UPDATE shb_rds_internal.sticky_honey_bun_rds_config "
+        "UPDATE sticky_honey_bun.config "
       . "SET value = 'arn:aws:lambda:us-east-1:000000000000:function:hijack' "
       . "WHERE key = 'lambda_arn'");
-    isnt($rc, 0, 'app cannot UPDATE shb_rds_internal.sticky_honey_bun_rds_config');
+    isnt($rc, 0, 'app cannot UPDATE sticky_honey_bun.config');
     like($stderr, qr/permission denied/i,
         'UPDATE denied with permission-denied error');
 }
@@ -51,8 +51,8 @@ my $as_app = sub { SHB_RDS::psql_run($cs_app, $_[0]) };
 # App role cannot DELETE — can't silence by removing the row.
 {
     my ($rc, undef, $stderr) = $as_app->(
-        "DELETE FROM shb_rds_internal.sticky_honey_bun_rds_config WHERE key = 'lambda_arn'");
-    isnt($rc, 0, 'app cannot DELETE FROM shb_rds_internal.sticky_honey_bun_rds_config');
+        "DELETE FROM sticky_honey_bun.config WHERE key = 'lambda_arn'");
+    isnt($rc, 0, 'app cannot DELETE FROM sticky_honey_bun.config');
     like($stderr, qr/permission denied/i,
         'DELETE denied with permission-denied error');
 }
@@ -61,9 +61,9 @@ my $as_app = sub { SHB_RDS::psql_run($cs_app, $_[0]) };
 # elsewhere if one was somehow deleted.
 {
     my ($rc, undef, $stderr) = $as_app->(
-        "INSERT INTO shb_rds_internal.sticky_honey_bun_rds_config(key, value) "
+        "INSERT INTO sticky_honey_bun.config(key, value) "
       . "VALUES ('lambda_arn', 'arn:aws:lambda:us-east-1:0:function:x')");
-    isnt($rc, 0, 'app cannot INSERT into shb_rds_internal.sticky_honey_bun_rds_config');
+    isnt($rc, 0, 'app cannot INSERT into sticky_honey_bun.config');
     like($stderr, qr/permission denied/i,
         'INSERT denied with permission-denied error');
 }

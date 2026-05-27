@@ -677,6 +677,14 @@ weekly fallback.
   WAL, not formatted row values, so `typoutput`/`typsend` is not invoked
   during replication. The trap only fires on actual *reads* on the replica.
 
+- **`pg_repack` does not trip the trap.** The online-repack rewrite path is
+  `CREATE TABLE AS` + log-table replay + catalog swap; none of those invoke
+  `typoutput`/`typsend`. Recheck when PG 19's built-in `REPACK CONCURRENTLY`
+  ships — its implementation uses logical replication under the covers, and
+  logical replication on the publisher DOES fire the trap (see above), so
+  the built-in concurrent repack may need an alert-processor suppression
+  rule the way `pg_dump` does.
+
 - **Output function errors are silently swallowed.** A broken log path,
   permissions issue, or disk-full condition will not surface as a SELECT
   error. This is intentional — surfacing errors would unmask the trap. The

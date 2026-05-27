@@ -39,6 +39,18 @@ RUN apt-get update \
         libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
+# pg_repack: exercised by t/variants/self-hosted/039_pg_repack.pl,
+# which confirms that a pg_repack heap rewrite does not fire the
+# trap. Install is best-effort — if the PGDG package for this
+# PG_MAJOR isn't published yet (e.g. immediately after a new major),
+# the test skip_alls cleanly on the missing binary instead of
+# blocking the rest of the suite.
+RUN apt-get update \
+    && (apt-get install -y --no-install-recommends \
+            postgresql-${PG_MAJOR}-repack \
+        || echo "pg_repack not available for PG ${PG_MAJOR}; 039 will skip") \
+    && rm -rf /var/lib/apt/lists/*
+
 # ORM client libraries we run against the trap
 # (t/variants/self-hosted/038_orm_reads.pl). Each ecosystem installs
 # system-wide so the testers can be invoked as plain

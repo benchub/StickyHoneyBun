@@ -50,6 +50,23 @@ my $cs_master = SHB_RDS::schema_setup($st, 'shb_t023');
         'app-role cast to honey_bun');
 }
 
+# App role cannot forge via CREATE TABLE either: a column of type honey_bun
+# requires USAGE on the type regardless of schema CREATE permissions. We
+# give the app role a schema it owns so the failure is specifically about
+# the type USAGE, not schema CREATE.
+{
+    SHB_RDS::psql_run($cs_master,
+        'CREATE SCHEMA IF NOT EXISTS shb_t023_forge AUTHORIZATION shbtest_app');
+    my $cs_forge = SHB_RDS::connstr($st,
+        user     => 'shbtest_app',
+        password => $st->{app_password});
+    SHB_Assertions::assert_create_column_of_type_denied(
+        sub { SHB_RDS::psql_run($cs_forge, $_[0]) },
+        'shb_t023_forge',
+        'honey_bun',
+        'app-role create honey_bun column');
+}
+
 # App role CAN read existing honey-bearing tables — typeoutput dispatch
 # doesn't require USAGE on the type, only SELECT on the table. This is
 # the load-bearing assertion that the trap fires for the role we're

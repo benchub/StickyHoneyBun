@@ -85,15 +85,15 @@ numbered test under the same number block.
 | 001 install | ✓ | ✓ | Shared: `assert_honey_bun_type_exists` |
 | 002 null_bypass | ✓ | ✓ | STRICT typeoutput; RDS uses `count_alerts` + sentinel sync |
 | 003 text_trip | ✓ | ✓ | Shared: `assert_text_trip` (full JSON-shape check) |
-| 004 binary_trip | ✓ | ✓ | pg_tle base types have no typsend; `COPY ... TO STDOUT BINARY` errors with "no binary output function" and the trap is NOT fired. The RDS test documents this as the expected (and operationally-relevant) behavior |
+| 004 binary_trip | ✓ | ✓ | self-hosted: `honey_bun_send` (typsend) is registered, so `COPY BINARY` succeeds and the trap fires with `event=read_binary`; RDS: pg_tle base types have no typsend, so `COPY ... TO STDOUT BINARY` errors with "no binary output function" before typeoutput dispatch — the trap is NOT fired, and the RDS test documents this as the expected (and operationally-relevant) limitation |
 | 005 pg_dump_trip | ✓ | ✓ | `pg_dump --data-only` against RDS dispatches typeoutput via COPY |
 | 006 tag_discrimination | ✓ | ✓ | Direct port |
 | 007 kill_switch | ✓ | →802, →806 | RDS has no GUC; 802 tests the "remove the destination" kill (`DELETE lambda_arn`); 806 tests the explicit `enabled=off` kill, which is the closer analog to self-hosted's `sticky_honey_bun.enabled` GUC |
-| 008 inventory | ✓ | ✓ | Shared: `assert_inventory_lists_columns` (schema-filtered) |
+| 008 inventory | ✓ | ✓ | Shared: `assert_inventory_lists_columns` (schema-filtered) + `assert_dropped_column_removed_from_inventory` |
 | 009 heartbeat | ✓ | →803 | No bgworker on RDS; uses external `tools/heartbeat_poker.sh` |
-| 010 alias_type | ✓ | ✓ | `create_honey_bun_alias` works in both variants |
+| 010 alias_type | ✓ | ✓ | Shared: `assert_alias_type_registered`, `assert_inventory_lists_columns`; `create_honey_bun_alias` works in both variants |
 | 011 select_shapes | ✓ | partial | RDS pg_tle lacks per-alias operators/aggregates, so `DISTINCT`/`ORDER BY`/`MIN`/`MAX`/`GROUP BY` shapes are not exercised |
-| 012 partial_index | ✓ | ✓ | Index build uses typcmp (not typeoutput) — silent in both variants |
+| 012 partial_index | ✓ | ✓ | self-hosted: index build on the honey column uses typcmp (not typeoutput) — silent, via `assert_partial_index_build_silent`; RDS: pg_tle has no btree opclass for honey_bun, so the RDS test indexes a scalar column with a `honey IS NOT NULL` predicate — the path is different but typeoutput is still not invoked |
 | 013 inventory_lockdown | ✓ | ✓ | Shared: `assert_inventory_locked_from_role` |
 | 014 long_query | ✓ | ✓ | 16 KB query padding fits in both the local log line and Lambda's 256 KB async-invocation payload |
 | 015 concurrent_writes | ✓ | ✓ | Self-hosted asserts flock prevents log-line interleaving; RDS asserts N concurrent reads each produce their own CloudWatch event (no Lambda Event-mode drops at modest concurrency) |
@@ -104,7 +104,7 @@ numbered test under the same number block.
 | 020 log_symlink_refusal | ✓ | — | No log file on RDS |
 | 021 multiline_queries | ✓ | ✓ | Direct port |
 | 022 json_in_queries | ✓ | ✓ | Direct port |
-| 023 type_usage_acl | ✓ | ✓ | Shared: `assert_cast_to_type_denied` + `assert_create_column_of_type_denied` |
+| 023 type_usage_acl | ✓ | ✓ | Shared: `assert_cast_to_type_denied`; self-hosted tests CREATE TABLE denial inline (with log-size invariant); RDS calls `assert_create_column_of_type_denied` |
 | 024 field_injection | ✓ | ✓ | Direct port; `tag` and `application_name` round-trip |
 | 025 log_permission_denied | ✓ | ✓ | RDS analog: an unreachable Lambda (bogus `lambda_arn`). The `EXCEPTION WHEN OTHERS THEN NULL` block in `honey_bun_out_rds` keeps the failure invisible to the caller — SELECT succeeds, returns rows, no error reaches the client |
 | 026 log_rotation | ✓ | — | No log file on RDS |
@@ -116,8 +116,8 @@ numbered test under the same number block.
 | 032 bgworker_resilience | ✓ | — | No bgworker on RDS |
 | 033 heartbeat_no_db | ✓ | — | No bgworker on RDS |
 | 034 logical_replication_acls | ✓ | — | Same as 029 |
-| 035 vacuum_analyze | ✓ | ✓ | ANALYZE and VACUUM walk the relation through typcmp / the storage layer, not typeoutput — neither fires the trap |
-| 036 set_role_detection | ✓ | ✓ | After `SET ROLE`, the alert carries `session_user` (immune) and `current_user` (role-switched) separately. RDS variant reconstructs `current_user` via `current_setting('role')` because `honey_bun_out_rds` is SECURITY DEFINER and would otherwise report the function owner |
+| 035 vacuum_analyze | ✓ | ✓ | Shared: `assert_maintenance_ops_silent`; ANALYZE and VACUUM walk the relation through typcmp / the storage layer, not typeoutput — neither fires the trap |
+| 036 set_role_detection | ✓ | ✓ | Shared: `assert_set_role_reflected_in_alert`; after `SET ROLE`, the alert carries `session_user` (immune) and `current_user` (role-switched) separately. RDS variant reconstructs `current_user` via `current_setting('role')` because `honey_bun_out_rds` is SECURITY DEFINER and would otherwise report the function owner |
 | 037 logical_rep_needs_extension | ✓ | — | Docker-only: subscriber without the extension cannot declare a `honey_bun` column; an operator who stubs the column as `text` to keep replication flowing creates an inert text-only mirror with no subscriber-side trap. Failure mode is in PG's type system, identical across variants — testing on RDS would require a second instance for no new coverage |
 | 038 orm_reads | ✓ | — | Docker-only: invokes ORMs across three language ecosystems doing their natural "fetch row" idiom against a honey-bearing table. Each tester must fire the trap. Current set: Python (psycopg2 baseline, SQLAlchemy, Django ORM), Ruby (ActiveRecord), Node (Sequelize). Scripts live in `t/orm-testers/`; adding more is a matter of dropping a new file there + adding its language runtime / dep-install to `docker/Dockerfile.test` + an `@testers` entry in the driver. Each tester individually skips when its runtime / library isn't on PATH; the whole file skips only when ALL testers are unavailable |
 | 801 cluster_id | — | ✓ | RDS-only: per-database config-table `cluster_id` differentiation |
@@ -126,4 +126,4 @@ numbered test under the same number block.
 | 804 config_tamper_resistance | — | ✓ | RDS-only: app role cannot SELECT/UPDATE/DELETE/INSERT on the config table; SECURITY DEFINER read by the trap function still works (parallels 019) |
 | 805 server_addr | — | ✓ | RDS-only: the alert payload's `server_addr` field identifies which node within a cluster fired the trap (primary vs read replica). `cluster_id` is shared across nodes because the config table is WAL-replicated, so `server_addr` is the load-bearing per-node identifier |
 | 806 enabled_kill_switch | — | ✓ | RDS analog of self-hosted 007: the locked-down `sticky_honey_bun.config` row `enabled='off'` silences the trap; only the extension owner can flip it (an app role's UPDATE attempt is permission-denied) |
-| 807 bytea_cast_denied | — | ✓ | RDS-only regression for the C1 finding in `REPORT.md`: pg_tle's `create_base_type` auto-registers a binary-compatible `pg_cast` between the new type and `bytea`, which would let `honey::bytea` silently reinterpret the bytes with zero typeoutput dispatch. The install body explicitly DROPs that cast in both directions; this test pins the absence and asserts that explicit casts now go through `honey_bun_out_rds` (firing the trap) |
+| 807 bytea_cast_denied | — | ✓ | RDS-only regression for the C1 finding in `REPORT.md`: pg_tle's `create_base_type` auto-registers a binary-compatible `pg_cast` between the new type and `bytea`, which would let `honey::bytea` silently reinterpret the bytes with zero typeoutput dispatch. The install body explicitly DROPs that cast in both directions; this test pins the absence — the `::bytea` cast now errors (no `pg_cast` entry, PG errors before typeoutput dispatch), data is not leaked, and the trap does NOT fire because typeoutput is never reached |

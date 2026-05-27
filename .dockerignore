@@ -8,3 +8,6 @@ regression.diffs
 regression.out
 .git/
 .gitignore
+# node_modules is generated inside the image by `npm install` in
+# /src; we never need to copy a host-side one in.
+node_modules/

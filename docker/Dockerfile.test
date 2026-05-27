@@ -30,10 +30,47 @@ RUN apt-get update \
         libipc-run-perl \
         libtest-simple-perl \
         libubsan1 \
+        python3 \
+        python3-pip \
+        ruby \
+        ruby-dev \
+        nodejs \
+        npm \
+        libpq-dev \
     && rm -rf /var/lib/apt/lists/*
+
+# ORM client libraries we run against the trap
+# (t/variants/self-hosted/038_orm_reads.pl). Each ecosystem installs
+# system-wide so the testers can be invoked as plain
+# `python3/ruby/node <script>` from the test driver. Library pinning
+# is loose (latest stable per registry) — these are big stable libs
+# and any breakage surfaces in the test build's own logs.
+
+# Python: psycopg2 (libpq baseline), SQLAlchemy (generic ORM), Django.
+# --break-system-packages because the test image is ephemeral and
+# Debian's PEP 668 marker is for desktop / production safety.
+RUN pip3 install --break-system-packages --no-cache-dir \
+        psycopg2-binary \
+        sqlalchemy \
+        django
+
+# Ruby: active_record + pg adapter. We pin major versions only so we
+# don't drift onto incompatible 8.x in the future, but otherwise track
+# latest.
+RUN gem install --no-document --silent \
+        pg \
+        activerecord:'~> 7.1'
 
 WORKDIR /src
 COPY . /src/
+
+# Node: sequelize + pg installed LOCALLY in /src/node_modules so
+# scripts under /src/t/orm-testers/ resolve them via node's normal
+# parent-directory module walk. Global install via Debian's npm
+# packaging has a non-standard prefix that NODE_PATH doesn't pick up
+# reliably; per-project node_modules is the most portable layout.
+RUN npm install --silent --no-audit --no-fund --no-progress \
+        sequelize@6 pg@8
 
 RUN make clean >/dev/null 2>&1 || true
 RUN make local

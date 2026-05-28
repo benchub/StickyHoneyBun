@@ -15,8 +15,7 @@ INSERT INTO customers (email, honey)
 VALUES ('do-not-touch@internal', 'public.customers.honey');
 ```
 
-Now any `SELECT * FROM customers` that returns that row produces a
-one-line JSON alert in the configured log file:
+Now any `SELECT * FROM customers` that returns that row produces a one-line JSON alert:
 
 ```json
 {"ts":"2026-05-25T04:11:36.205673Z","event":"read_text","tag":"public.customers.honey","session_user":"alice","client_addr":"10.0.4.7","query":"SELECT * FROM customers"}
@@ -279,12 +278,14 @@ shared_preload_libraries = 'sticky_honey_bun'
 
 | Name | Type | Default | Description |
 |---|---|---|---|
-| `sticky_honey_bun.log_path` | string | resolved from `log_directory` | Path to the alert file. Locked at server start to prevent a compromised superuser from redirecting writes (e.g. to `/dev/null`) via `ALTER SYSTEM`. Parent directory must exist. |
+| `sticky_honey_bun.log_path` | string | resolved from `log_directory` | Path to the alert file. Set to the empty string (`''`) to disable the file sink entirely — typically paired with `alert_log_level` so events flow only into PG's own log stream. Locked at server start to prevent a compromised superuser from redirecting writes (e.g. to `/dev/null`) via `ALTER SYSTEM`. Parent directory must exist. |
 | `sticky_honey_bun.enabled` | bool | `on` | Master kill switch. Locked at server start so a compromised superuser session cannot disable the trap via `ALTER SYSTEM`. |
 | `sticky_honey_bun.heartbeat_interval_seconds` | int (seconds) | `60` | Seconds between heartbeat lines from the bgworker. `0` disables heartbeats. Locked at server start to prevent runtime silencing. |
 | `sticky_honey_bun.terminate_on_read` | bool | `off` | When `on`, a backend that reads a honey value is terminated (via SIGTERM) immediately after the alert is logged. Unmasks the trap to the attacker; in exchange the in-flight query halts at the next CHECK_FOR_INTERRUPTS. Only ordinary client backends are terminated — the heartbeat bgworker, parallel workers, and walsenders are spared. Locked at server start. |
+| `sticky_honey_bun.alert_log_level` | enum | `off` | When set to a non-`off` value, each trap event is also emitted into PG's own log stream via `ereport()` at the named level. Accepts `off`, `debug5..debug1`, `log`, `info`, `notice`, `warning` — `error` and higher are excluded by design. Lets an operator consume events from the PG log stream they already ship (Observe agent, rsyslog, vector, etc.) without standing up a tail of `log_path`. Combine with `log_path = ''` for "log stream is the sole sink." Locked at server start. |
+| `sticky_honey_bun.heartbeat_log_level` | enum | `off` | Same enum as `alert_log_level`; controls the bgworker's heartbeat stream independently so an operator can keep heartbeats at `LOG` and alerts at `WARNING` (or filter them apart at the shipper). Locked at server start. |
 
-All four GUCs are deliberately `PGC_POSTMASTER`: they can only be set in
+All six GUCs are deliberately `PGC_POSTMASTER`: they can only be set in
 `postgresql.conf` at server start. Changing them requires a real server
 restart, which is auditable infrastructure activity rather than a quiet
 `ALTER SYSTEM` call.
@@ -335,9 +336,11 @@ REVOKE ALL ON sticky_honey_bun.config FROM PUBLIC;
 
 | Key | Description |
 |---|---|
-| `lambda_arn` | ARN of the Lambda to invoke on trap events. Required for alerts to fire; absent or empty disables alerting (the trap returns the tag transparently). |
+| `lambda_arn` | ARN of the Lambda to invoke on trap events. Absent or empty disables the Lambda sink. When `alert_log_level` is also unset, the trap returns the tag transparently with no event emitted anywhere — useful while the Lambda is being deployed. When `alert_log_level` IS set, an absent `lambda_arn` is the supported "log stream is the sole sink" deployment. |
 | `cluster_id` | Optional identifier emitted in the payload so a shared Lambda can route by source cluster. |
-| `enabled` | Optional owner-controlled kill switch. Absent or anything that isn't one of `off` / `false` / `0` / `no` is treated as enabled. When set to a disable value, the trap returns the tag without firing the Lambda. |
+| `enabled` | Optional owner-controlled kill switch. Absent or anything that isn't one of `off` / `false` / `0` / `no` is treated as enabled. When set to a disable value, the trap returns the tag without firing either sink. |
+| `alert_log_level` | Optional. When set to one of `debug`, `log`, `info`, `notice`, `warning`, each trap event is also emitted into PG's log stream at that level via `RAISE`. Absent or `off` disables the log-stream sink. Combine with absent `lambda_arn` to consume events entirely from CloudWatch Logs (RDS already exports the PG log there). |
+| `heartbeat_log_level` | Optional. Same accepted values as `alert_log_level`. Reads whose tag starts with `sticky_honey_bun.heartbeat` (the convention used by `tools/heartbeat_poker.sh`) route to this level instead of `alert_log_level`, so an operator can keep heartbeats at `LOG` and alerts at `WARNING`. |
 
 The output function `honey_bun_out_rds` runs `SECURITY DEFINER` and reads
 this table as the extension owner. PUBLIC has no `SELECT`, `INSERT`,
@@ -611,6 +614,64 @@ the brand:
   whose ingest characteristics handle your worst-case burst, and
   size the local-file rotation around the same number.
 
+### Log-stream-only deployment
+
+The default sinks (file on self-hosted, Lambda on RDS) are separate
+event streams that you ship to the alert processor on the side. If you already
+ship PG's own log stream — `csvlog` / `jsonlog` rotated by `logrotate`,
+CloudWatch Logs export on RDS, an rsyslog/journald forwarder, `vector`,
+etc. — you can drop the secondary stream and consume everything from
+the PG log alone.
+
+Self-hosted:
+
+```
+shared_preload_libraries        = 'sticky_honey_bun'
+sticky_honey_bun.log_path       = ''
+sticky_honey_bun.alert_log_level     = warning
+sticky_honey_bun.heartbeat_log_level = log
+```
+
+Each trap event becomes an `ereport(WARNING, ...)` whose `errmsg` is
+the same JSON one-liner that would otherwise have gone to the file;
+each heartbeat becomes an `ereport(LOG, ...)`. Set
+`log_min_messages` low enough (`log` covers both) for the heartbeat
+stream to actually reach the server log. The alert processor then
+greps `event=read_text` / `event=heartbeat` out of whatever pipeline
+your PG log already feeds.
+
+RDS:
+
+```sql
+INSERT INTO sticky_honey_bun.config(key, value) VALUES
+  ('alert_log_level',     'warning'),
+  ('heartbeat_log_level', 'log')
+ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+DELETE FROM sticky_honey_bun.config WHERE key = 'lambda_arn';
+```
+
+The PL/pgSQL output function emits the same JSON payload via `RAISE`,
+which RDS includes in its PG-log CloudWatch Logs export. The Lambda
+path is then optional; you can keep both sinks if you want belt and
+suspenders. Heartbeats from `tools/heartbeat_poker.sh` are routed to
+`heartbeat_log_level` by matching the documented
+`sticky_honey_bun.heartbeat*` tag prefix.
+
+Trade-offs vs. the default sinks:
+
+- **Pro**: one less pipeline to wire up; PG-log shippers already have
+  retention, multi-region replication, and access controls solved.
+- **Pro**: a stuck/broken Lambda or file-permission issue no longer
+  drops events silently; the PG log is the single source of truth.
+- **Con**: the PG log is noisier than the dedicated sink — your
+  filter has to grep for the JSON shape, and `log_min_messages` may
+  need to drop low enough to surface `log`-level heartbeats.
+- **Con**: a compromised superuser session has more surface area to
+  manipulate the PG log (rotation, file path) than to manipulate the
+  bgworker-written file. The new GUCs are `PGC_POSTMASTER` to close
+  the direct-flip path, but the underlying PG-log infrastructure is
+  not Sticky Honey Bun's to harden.
+
 ### Capacity guidance
 
 Rough planning numbers:
@@ -639,6 +700,8 @@ weekly fallback.
 | `terminate_on_read = on` enabled by surprise | legitimate scans (audits, ORM batch jobs) terminate connections | enable only after rehearsing with non-production traffic |
 | Forgot to `GRANT USAGE ON TYPE honey_bun` to a non-superuser planter role | `INSERT INTO honey_table` fails with `permission denied for type` | grant USAGE to the specific planter role; the trap mechanism itself does not need USAGE |
 | Subscriber replicating a honey-bearing table without USAGE on the subscriber cluster | the apply worker errors out and the subscription stalls | grant USAGE on the subscriber to whichever role owns the subscription |
+| `log_path=''` (or `lambda_arn` absent on RDS) WITHOUT setting `alert_log_level` | the trap fires but every event is silently dropped — no file, no Lambda, no log line | set `alert_log_level` (and `heartbeat_log_level`) when you turn off the primary sink. `log_path=''` alone is the "log stream is the sole sink" deployment; the levels are not optional in that mode |
+| `log_min_messages` set above `alert_log_level` in a log-stream-only deployment | trap events ereport correctly but the PG log filters them out | match `log_min_messages` to (or below) the lowest level you've configured; `log_min_messages = log` covers both `LOG` heartbeats and `WARNING` alerts |
 
 ## Roadmap
 

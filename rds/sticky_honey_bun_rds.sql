@@ -18,8 +18,21 @@
 --   -- run as the extension owner):
 --   INSERT INTO sticky_honey_bun.config(key, value) VALUES
 --     ('lambda_arn', 'arn:aws:lambda:REGION:ACCOUNT:function:NAME'),
---     ('cluster_id', 'my-cluster')   -- optional
+--     ('cluster_id', 'my-cluster')                -- optional
+--     ('alert_log_level', 'warning'),             -- optional: copy events
+--     ('heartbeat_log_level', 'log')              --   into PG's log stream
 --   ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+--
+-- Sinks (independent — set either, neither, or both):
+--   * lambda_arn      → fire-and-forget aws_lambda.invoke per event.
+--                       Absent or empty = no Lambda call.
+--   * alert_log_level / heartbeat_log_level → ereport the same JSON
+--                       payload at this PG log level (debug, log,
+--                       info, notice, warning). 'off' (or absent) =
+--                       no log emission. With log levels set and
+--                       lambda_arn absent, the PG log stream is the
+--                       sole sink — useful when CloudWatch Logs
+--                       export already ships PG logs.
 --
 -- Configuration storage rationale: RDS rejects custom-namespace GUCs in
 -- parameter groups, and `ALTER DATABASE/ROLE SET sticky_honey_bun_rds.foo`
@@ -113,11 +126,14 @@ SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
 DECLARE
-    tag        text := convert_from(stored, 'UTF8');
-    arn        text;
-    enabled    text;
-    cluster_id text;
-    payload    jsonb;
+    tag          text := convert_from(stored, 'UTF8');
+    arn          text;
+    enabled      text;
+    cluster_id   text;
+    is_heartbeat boolean;
+    log_level    text;
+    payload      jsonb;
+    payload_text text;
 BEGIN
     -- Read locked-down config. PUBLIC cannot reach this table directly,
     -- but SECURITY DEFINER means we run as the extension owner, which has
@@ -137,13 +153,32 @@ BEGIN
         RETURN tag;
     END IF;
 
+    -- Identify heartbeat reads (the external poker convention from the
+    -- README's tools/heartbeat_poker.sh section). Heartbeats route to
+    -- heartbeat_log_level; everything else routes to alert_log_level.
+    -- The prefix is fixed-string so it can't be silenced by a tag value
+    -- the operator never planted.
+    is_heartbeat := tag LIKE 'sticky_honey_bun.heartbeat%';
+
+    SELECT value INTO log_level
+      FROM sticky_honey_bun.config
+     WHERE key = CASE WHEN is_heartbeat THEN 'heartbeat_log_level'
+                                        ELSE 'alert_log_level' END;
+    IF log_level IS NULL OR log_level = '' OR log_level = 'off' THEN
+        log_level := NULL;  -- canonicalize the "no log emission" path
+    END IF;
+
     SELECT value INTO arn
       FROM sticky_honey_bun.config
      WHERE key = 'lambda_arn';
     IF arn IS NULL OR arn = '' THEN
-        -- No Lambda configured — return the tag without firing. Lets the
-        -- extension be installed before the Lambda exists.
-        RETURN tag;
+        -- No Lambda configured. If there's also no log_level, return the
+        -- tag without firing — same behavior as before this feature, so
+        -- the extension can be installed before either sink exists.
+        IF log_level IS NULL THEN
+            RETURN tag;
+        END IF;
+        arn := NULL;        -- canonicalize the "no Lambda invoke" path
     END IF;
     SELECT value INTO cluster_id
       FROM sticky_honey_bun.config
@@ -187,17 +222,43 @@ BEGIN
         'server_addr',      coalesce(inet_server_addr()::text, 'local')
     );
 
-    BEGIN
-        PERFORM aws_lambda.invoke(
-            function_name   := arn,
-            payload         := payload,
-            invocation_type := 'Event'
-        );
-    EXCEPTION WHEN OTHERS THEN
-        -- Swallow all errors so a broken Lambda or revoked IAM permission
-        -- never surfaces as a query error and unmasks the trap.
-        NULL;
-    END;
+    -- Optional log-stream sink. PL/pgSQL's RAISE takes a literal level
+    -- keyword (no dynamic level form), so we dispatch through a CASE.
+    -- The whole block is wrapped in its own exception handler — a bad
+    -- value in the config table should never reach the caller as an
+    -- error, same fail-quiet contract as the Lambda invoke below.
+    IF log_level IS NOT NULL THEN
+        payload_text := payload::text;
+        BEGIN
+            CASE log_level
+                WHEN 'debug', 'debug1', 'debug2',
+                     'debug3', 'debug4', 'debug5'
+                    THEN RAISE DEBUG   '%', payload_text;
+                WHEN 'log'     THEN RAISE LOG     '%', payload_text;
+                WHEN 'info'    THEN RAISE INFO    '%', payload_text;
+                WHEN 'notice'  THEN RAISE NOTICE  '%', payload_text;
+                WHEN 'warning' THEN RAISE WARNING '%', payload_text;
+                ELSE NULL;  -- unknown level: silently drop
+            END CASE;
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END IF;
+
+    IF arn IS NOT NULL THEN
+        BEGIN
+            PERFORM aws_lambda.invoke(
+                function_name   := arn,
+                payload         := payload,
+                invocation_type := 'Event'
+            );
+        EXCEPTION WHEN OTHERS THEN
+            -- Swallow all errors so a broken Lambda or revoked IAM
+            -- permission never surfaces as a query error and unmasks the
+            -- trap.
+            NULL;
+        END;
+    END IF;
 
     RETURN tag;
 END;

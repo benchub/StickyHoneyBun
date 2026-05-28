@@ -32,6 +32,41 @@ static bool  shb_enabled           = true;
 static bool  shb_terminate_on_read = false;
 
 /*
+ * Copy each event into PG's own logging stream at this elevel. Defaults
+ * to a sentinel (-1) meaning "off, do not ereport". When set, an operator
+ * can consume events from the PG log stream they already ship (rsyslog,
+ * CloudWatch agent, vector, etc.) instead of standing up a tail of the
+ * sticky_honey_bun.log file. Combined with log_path = '' this is the
+ * "log stream is the sole sink" deployment.
+ *
+ * elevels we accept are DEBUG5..WARNING — read-only severities that
+ * never abort the typeoutput dispatch. We deliberately exclude ERROR/
+ * FATAL/PANIC: the subtxn wrapper around do_log_event would swallow
+ * the longjmp without unmasking the trap, but the JSON line would
+ * still emit, and a future contributor would be one config-typo away
+ * from a really confusing failure mode. Better to make the enum say
+ * "off, debug5..warning" and refuse the dangerous cases at GUC parse
+ * time.
+ */
+#define SHB_LOG_LEVEL_OFF (-1)
+static int shb_alert_log_level     = SHB_LOG_LEVEL_OFF;
+static int shb_heartbeat_log_level = SHB_LOG_LEVEL_OFF;
+
+static const struct config_enum_entry shb_log_level_options[] = {
+    {"off",     SHB_LOG_LEVEL_OFF, false},
+    {"debug5",  DEBUG5,            false},
+    {"debug4",  DEBUG4,            false},
+    {"debug3",  DEBUG3,            false},
+    {"debug2",  DEBUG2,            false},
+    {"debug1",  DEBUG1,            false},
+    {"log",     LOG,               false},
+    {"info",    INFO,              false},
+    {"notice",  NOTICE,            false},
+    {"warning", WARNING,           false},
+    {NULL, 0, false}
+};
+
+/*
  * Path resolved once at _PG_init in TopMemoryContext, then frozen for the
  * lifetime of the postmaster (inherited by every backend via fork). This
  * is what closes the log_directory bypass: GetConfigOption("log_directory")
@@ -46,13 +81,47 @@ shb_register_gucs(void)
 {
     DefineCustomStringVariable(
         "sticky_honey_bun.log_path",
-        "Path to the Sticky Honey Bun alert log file.",
+        "Path to the Sticky Honey Bun alert log file. Empty string disables.",
         "Defaults to <log_directory>/" SHB_DEFAULT_FILENAME " if log_directory "
-        "is set, else " SHB_FALLBACK_DIR "/" SHB_DEFAULT_FILENAME ". "
+        "is set, else " SHB_FALLBACK_DIR "/" SHB_DEFAULT_FILENAME ". Set to the "
+        "empty string ('') to disable the file sink entirely — typically "
+        "paired with sticky_honey_bun.alert_log_level so events flow only "
+        "into PG's own logging stream. "
         "PGC_POSTMASTER: locked at server start so a compromised superuser "
         "cannot redirect alert writes (e.g. to /dev/null) via ALTER SYSTEM.",
         &shb_log_path,
         NULL,
+        PGC_POSTMASTER,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomEnumVariable(
+        "sticky_honey_bun.alert_log_level",
+        "Severity at which to copy trap events into PG's own log stream.",
+        "When set to anything other than 'off', each trap event (the same "
+        "JSON line that's appended to log_path) is also emitted via ereport() "
+        "at the named PG log level. This lets operators run the extension "
+        "with log_path='' and consume alerts entirely from the PG log stream "
+        "they already ship. Accepts off, debug5..debug1, log, info, notice, "
+        "warning; error and higher are excluded by design. PGC_POSTMASTER: "
+        "locked at server start.",
+        &shb_alert_log_level,
+        SHB_LOG_LEVEL_OFF,
+        shb_log_level_options,
+        PGC_POSTMASTER,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomEnumVariable(
+        "sticky_honey_bun.heartbeat_log_level",
+        "Severity at which to copy bgworker heartbeats into PG's own log stream.",
+        "Independent of alert_log_level so an operator can keep heartbeats at "
+        "LOG and alerts at WARNING (or filter them apart in CloudWatch / "
+        "rsyslog). Same value set as alert_log_level. PGC_POSTMASTER: locked "
+        "at server start.",
+        &shb_heartbeat_log_level,
+        SHB_LOG_LEVEL_OFF,
+        shb_log_level_options,
         PGC_POSTMASTER,
         0,
         NULL, NULL, NULL);
@@ -94,8 +163,19 @@ resolve_log_path(void)
 {
     const char *dir;
 
-    if (shb_log_path && shb_log_path[0])
-        return pstrdup(shb_log_path);
+    /*
+     * Explicit empty string ('') is the operator's "no file sink" signal.
+     * Return NULL so shb_resolved_log_path stays NULL and write_line_locked
+     * early-returns on every event. Distinct from the unset case (NULL
+     * pointer), which falls through to the log_directory resolution chain
+     * for backward compatibility with installs that pre-date this knob.
+     */
+    if (shb_log_path)
+    {
+        if (shb_log_path[0])
+            return pstrdup(shb_log_path);
+        return NULL;
+    }
 
     dir = GetConfigOption("log_directory", true, false);
     if (dir && dir[0])
@@ -288,6 +368,16 @@ do_log_event(const char *event, const char *tag)
     append_kv_str(&line, "server_addr", server, false);
     append_kv_str(&line, "query", debug_query_string, false);
     appendStringInfoChar(&line, '}');
+
+    /*
+     * ereport BEFORE the trailing newline so PG's logger gets a clean
+     * single-line message (it adds its own line break). The write to the
+     * file sink needs the newline so consumers tailing the file see one
+     * event per line, so we append it after.
+     */
+    if (shb_alert_log_level != SHB_LOG_LEVEL_OFF)
+        ereport(shb_alert_log_level, (errmsg_internal("%s", line.data)));
+
     appendStringInfoChar(&line, '\n');
 
     write_line_locked(&line);
@@ -394,6 +484,11 @@ shb_log_heartbeat(void)
         appendStringInfoString(&line, ",\"tag\":\"heartbeat\"");
         appendStringInfo(&line, ",\"pid\":%d", MyProcPid);
         appendStringInfoChar(&line, '}');
+
+        if (shb_heartbeat_log_level != SHB_LOG_LEVEL_OFF)
+            ereport(shb_heartbeat_log_level,
+                    (errmsg_internal("%s", line.data)));
+
         appendStringInfoChar(&line, '\n');
 
         write_line_locked(&line);
